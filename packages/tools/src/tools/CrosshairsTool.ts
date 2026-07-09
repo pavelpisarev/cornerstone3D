@@ -218,6 +218,21 @@ class CrosshairsTool extends AnnotationTool {
           color: 'rgba(255, 255, 0, 0.5)',
           size: 2,
         },
+        // Renders a grabbable circle handle at the crosshairs' tool center
+        // (the point where all reference lines intersect). Since the area
+        // right around the tool center is usually kept clear of reference
+        // lines (see referenceLinesCenterGapRadius/Ratio), this handle gives
+        // users something to click-and-drag in order to translate the whole
+        // crosshair (all linked viewports), which otherwise would only be
+        // possible by dragging one of the reference lines directly. This
+        // works in both Active and Passive tool modes.
+        centerHandle: {
+          enabled: true,
+          // Visual + hit-test radius (in canvas pixels) of the center handle.
+          // Falls back to `handleRadius` when not provided.
+          radius: null,
+          color: null,
+        },
         mobile: {
           enabled: false,
           opacity: 0.8,
@@ -1621,6 +1636,32 @@ class CrosshairsTool extends AnnotationTool {
       );
     }
 
+    if (this.configuration.centerHandle?.enabled) {
+      const centerHandleConfig = this.configuration.centerHandle;
+      const centerHandleColor = centerHandleConfig.color || color;
+      const centerHandleRadius =
+        centerHandleConfig.radius ?? this.configuration.handleRadius ?? 3;
+
+      const isCenterHandleActive =
+        data.handles.activeOperation === OPERATION.DRAG &&
+        data.activeViewportIds?.length > 0;
+
+      drawCircleSvg(
+        svgDrawingHelper,
+        annotationUID,
+        'centerHandle',
+        crosshairCenterCanvas as Types.Point2,
+        centerHandleRadius,
+        {
+          color: centerHandleColor,
+          fill: isCenterHandleActive ? centerHandleColor : 'rgba(0, 0, 0, 0)',
+          fillOpacity: isCenterHandleActive ? 0.6 : 0,
+          strokeOpacity:
+            viewportAnnotation.highlighted || isCenterHandleActive ? 1 : 0.8,
+        }
+      );
+    }
+
     return renderStatus;
   };
 
@@ -2828,12 +2869,93 @@ class CrosshairsTool extends AnnotationTool {
     return null;
   }
 
+  /**
+   * Returns the ids of the other (non-current) viewports in the toolGroup
+   * whose reference lines/cameras should be translated together when the
+   * crosshairs tool center is dragged directly (e.g. via the center handle).
+   * This mirrors the filtering used when a single reference line is dragged,
+   * but includes every other controllable+draggable viewport instead of just
+   * the ones whose line is under the cursor.
+   *
+   * @param currentViewportId - The id of the viewport the drag started from.
+   * @returns Array of viewport ids to translate.
+   */
+  _getAllDraggableOtherViewportIds = (currentViewportId: string): string[] => {
+    const viewportsInfo = this._getViewportsInfo();
+    const viewportIds = [];
+
+    viewportsInfo.forEach(({ viewportId }) => {
+      if (viewportId === currentViewportId) {
+        return;
+      }
+
+      if (
+        this._getReferenceLineControllable(viewportId) &&
+        this._getReferenceLineDraggableRotatable(viewportId)
+      ) {
+        viewportIds.push(viewportId);
+      }
+    });
+
+    return viewportIds;
+  };
+
+  /**
+   * Checks whether the given canvas coordinates are near the crosshairs'
+   * center handle (a small circle rendered at the tool center). If so, it
+   * marks the annotation as ready for a translation (DRAG) operation
+   * affecting every other draggable viewport, so that dragging from the
+   * center moves the whole crosshair instead of a single reference line.
+   */
+  _getCenterHandleNearImagePoint(
+    viewport,
+    annotation: CrosshairsAnnotation,
+    canvasCoords: Types.Point2,
+    proximity: number
+  ): boolean {
+    const centerHandleConfig = this.configuration.centerHandle;
+    if (!centerHandleConfig?.enabled) {
+      return false;
+    }
+
+    const centerCanvas = viewport.worldToCanvas(this.toolCenter);
+    const centerHandleRadius =
+      centerHandleConfig.radius ?? this.configuration.handleRadius ?? 3;
+    const centerHandleProximity = Math.max(centerHandleRadius, proximity);
+
+    if (vec2.distance(canvasCoords, centerCanvas) > centerHandleProximity) {
+      return false;
+    }
+
+    const { data } = annotation;
+    data.handles.activeOperation = OPERATION.DRAG;
+    data.activeViewportIds = this._getAllDraggableOtherViewportIds(viewport.id);
+
+    this.editData = {
+      annotation,
+    };
+
+    return true;
+  }
+
   _pointNearTool(element, annotation, canvasCoords, proximity) {
     const minimalCrosshairConfig = getMinimalCrosshairConfig(
       this.configuration
     );
     const enabledElement = getEnabledElement(element);
     const { viewport } = enabledElement;
+
+    if (
+      this._getCenterHandleNearImagePoint(
+        viewport,
+        annotation,
+        canvasCoords,
+        proximity
+      )
+    ) {
+      return true;
+    }
+
     const { clientWidth, clientHeight } = getDisplayedCanvasSize(viewport);
     const canvasDiagonalLength = Math.sqrt(
       clientWidth * clientWidth + clientHeight * clientHeight
