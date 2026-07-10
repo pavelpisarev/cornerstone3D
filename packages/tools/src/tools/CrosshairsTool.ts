@@ -148,6 +148,7 @@ class CrosshairsTool extends AnnotationTool {
 
   toolCenter: Types.Point3 = [0, 0, 0]; // NOTE: it is assumed that all the active/linked viewports share the same crosshair center.
   // This because the rotation operation rotates also all the other active/intersecting reference lines of the same angle
+  _lastValidToolCenter: Types.Point3 | null = null;
   _getReferenceLineColor?: (viewportId: string) => string;
   _getReferenceLineControllable?: (viewportId: string) => boolean;
   _getReferenceLineDraggableRotatable?: (viewportId: string) => boolean;
@@ -596,16 +597,17 @@ class CrosshairsTool extends AnnotationTool {
         // configured, or the linked toolGroup isn't reachable/compatible
         // yet — e.g. this is a pure standalone 2D/3D viewer with no MPR
         // crosshair at all, or MPR just hasn't computed its own center
-        // yet), fall back to this viewport's own current camera focal
-        // point instead of leaving the tool center at the default
-        // `[0, 0, 0]` (which would place the center handle off-screen).
-        // Only done once (`_standaloneToolCenterInitialized`): once we
-        // have *any* tool center (fallback or synced), further calls must
-        // not reset it back to "this viewport's own view" — only a
-        // genuinely newer synced value (via pull or the live listener)
-        // should ever move it after that.
+        // yet), fall back to the last known valid tool center (preserved
+        // across layout switches) before falling back to this viewport's
+        // own current camera focal point.
         if (!pulled && !this._standaloneToolCenterInitialized) {
-          this._initializeStandaloneToolCenterFromOwnViewport(viewportsInfo);
+          if (this._lastValidToolCenter) {
+            this.toolCenter = [...this._lastValidToolCenter] as Types.Point3;
+            this._standaloneToolCenterInitialized = true;
+            this._syncStandaloneStackSlices(viewportsInfo, this.toolCenter);
+          } else {
+            this._initializeStandaloneToolCenterFromOwnViewport(viewportsInfo);
+          }
         }
 
         // If nothing worked this time (linked toolGroup not ready yet),
@@ -739,13 +741,48 @@ class CrosshairsTool extends AnnotationTool {
         this.getToolName()
       ) as CrosshairsTool | undefined;
 
-      if (linkedInstance?.toolCenter) {
-        const applied = this._applyExternalToolCenter(
-          linkedInstance.toolCenter,
-          linkedInstance._getOwnFrameOfReferenceUID()
-        );
-        if (applied) {
-          return true;
+      if (!linkedInstance) {
+        continue;
+      }
+
+      const linkedFrameOfReferenceUID =
+        linkedInstance._getOwnFrameOfReferenceUID();
+
+      if (linkedInstance.toolCenter) {
+        if (
+          this._isFinitePoint3(linkedInstance.toolCenter) &&
+          !(
+            Math.abs(linkedInstance.toolCenter[0]) < 1e-3 &&
+            Math.abs(linkedInstance.toolCenter[1]) < 1e-3 &&
+            Math.abs(linkedInstance.toolCenter[2]) < 1e-3
+          )
+        ) {
+          const applied = this._applyExternalToolCenter(
+            linkedInstance.toolCenter,
+            linkedFrameOfReferenceUID
+          );
+          if (applied) {
+            return true;
+          }
+        }
+      }
+
+      if (linkedInstance._lastValidToolCenter) {
+        if (
+          this._isFinitePoint3(linkedInstance._lastValidToolCenter) &&
+          !(
+            Math.abs(linkedInstance._lastValidToolCenter[0]) < 1e-3 &&
+            Math.abs(linkedInstance._lastValidToolCenter[1]) < 1e-3 &&
+            Math.abs(linkedInstance._lastValidToolCenter[2]) < 1e-3
+          )
+        ) {
+          const applied = this._applyExternalToolCenter(
+            linkedInstance._lastValidToolCenter,
+            linkedFrameOfReferenceUID
+          );
+          if (applied) {
+            return true;
+          }
         }
       }
     }
@@ -891,6 +928,16 @@ class CrosshairsTool extends AnnotationTool {
     if (!this._isFinitePoint3(toolCenter)) {
       return false;
     }
+
+    if (
+      Math.abs(toolCenter[0]) < 1e-3 &&
+      Math.abs(toolCenter[1]) < 1e-3 &&
+      Math.abs(toolCenter[2]) < 1e-3
+    ) {
+      return false;
+    }
+
+    this._lastValidToolCenter = [...toolCenter] as Types.Point3;
 
     const viewportsInfo = this._getViewportsInfo();
     if (!viewportsInfo.length) {
@@ -1171,6 +1218,17 @@ class CrosshairsTool extends AnnotationTool {
     }
 
     this.toolCenter = toolCenter;
+
+    if (
+      this._isFinitePoint3(toolCenter) &&
+      !(
+        Math.abs(toolCenter[0]) < 1e-3 &&
+        Math.abs(toolCenter[1]) < 1e-3 &&
+        Math.abs(toolCenter[2]) < 1e-3
+      )
+    ) {
+      this._lastValidToolCenter = [...toolCenter] as Types.Point3;
+    }
 
     if (!suppressEvents) {
       triggerEvent(eventTarget, Events.CROSSHAIR_TOOL_CENTER_CHANGED, {
@@ -1594,6 +1652,18 @@ class CrosshairsTool extends AnnotationTool {
       if (renderingEngineId) {
         this.initializeViewport({ viewportId, renderingEngineId });
       }
+
+      if (
+        !this._standaloneToolCenterInitialized ||
+        !this._isFinitePoint3(this.toolCenter) ||
+        (Math.abs(this.toolCenter[0]) < 1e-3 &&
+          Math.abs(this.toolCenter[1]) < 1e-3 &&
+          Math.abs(this.toolCenter[2]) < 1e-3)
+      ) {
+        this.toolCenter = [...newFocalPoint] as Types.Point3;
+        this._standaloneToolCenterInitialized = true;
+      }
+
       triggerAnnotationRenderForViewportIds([viewportId]);
       return;
     }
@@ -2567,6 +2637,15 @@ class CrosshairsTool extends AnnotationTool {
 
   _onNewVolume = (_evt?: Event) => {
     this._syncVolumeListenersWithToolGroup();
+
+    if (!this.configuration.standalone) {
+      const pulled = this._pullToolCenterFromLinkedToolGroups();
+      if (!pulled && this._lastValidToolCenter) {
+        this.setToolCenter(this._lastValidToolCenter, false);
+        return;
+      }
+    }
+
     this._recomputeToolCenterFromAbsoluteCameras({
       emitEvent: true,
       updateViewportCameras: false,
@@ -4336,6 +4415,14 @@ class CrosshairsTool extends AnnotationTool {
         return;
       }
 
+      if (
+        Math.abs(point[0]) < 1e-3 &&
+        Math.abs(point[1]) < 1e-3 &&
+        Math.abs(point[2]) < 1e-3
+      ) {
+        return;
+      }
+
       vec3.normalize(normal, normal);
 
       const alreadyTracked = uniquePlanes.some(
@@ -4405,7 +4492,11 @@ class CrosshairsTool extends AnnotationTool {
     emitEvent?: boolean;
     updateViewportCameras?: boolean;
   } = {}): Types.Point3 | null => {
-    const toolCenter = this._calculateToolCenterFromAbsoluteCameras();
+    let toolCenter = this._calculateToolCenterFromAbsoluteCameras();
+
+    if (!toolCenter && this._lastValidToolCenter) {
+      toolCenter = [...this._lastValidToolCenter] as Types.Point3;
+    }
 
     if (!toolCenter) {
       return null;
