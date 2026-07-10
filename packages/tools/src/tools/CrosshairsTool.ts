@@ -134,6 +134,8 @@ const OPERATION = {
  */
 class CrosshairsTool extends AnnotationTool {
   static toolName;
+  static _sharedCenterByFrameOfReference = new Map<string, Types.Point3>();
+  static _sharedLastCenter: Types.Point3 | null = null;
   static minimalModeExamples = new Map<
     string,
     {
@@ -149,6 +151,7 @@ class CrosshairsTool extends AnnotationTool {
   toolCenter: Types.Point3 = [0, 0, 0]; // NOTE: it is assumed that all the active/linked viewports share the same crosshair center.
   // This because the rotation operation rotates also all the other active/intersecting reference lines of the same angle
   _lastValidToolCenter: Types.Point3 | null = null;
+  _lastKnownFrameOfReferenceUID: string | null = null;
   _getReferenceLineColor?: (viewportId: string) => string;
   _getReferenceLineControllable?: (viewportId: string) => boolean;
   _getReferenceLineDraggableRotatable?: (viewportId: string) => boolean;
@@ -207,6 +210,10 @@ class CrosshairsTool extends AnnotationTool {
     worldPoint: Types.Point3;
     excludeKey?: string;
   } | null = null;
+  // Short bootstrap window to ignore camera-driven absolute center recompute
+  // noise while MPR viewports are being (re)created and cameras are still
+  // settling to defaults.
+  _suppressAbsoluteRecomputeUntil = 0;
 
   constructor(
     toolProps: PublicToolProps = {},
@@ -314,6 +321,9 @@ class CrosshairsTool extends AnnotationTool {
         // viewports share the same FrameOfReferenceUID as the sender (so
         // having multiple, unrelated studies open at once is harmless).
         syncWithToolGroupIds: [],
+        // Emits verbose console logs for tool-center resolution/sync.
+        // Can also be enabled globally via `globalThis.__CROSSHAIRS_DEBUG__ = true`.
+        debug: false,
       },
     }
   ) {
@@ -535,7 +545,18 @@ class CrosshairsTool extends AnnotationTool {
    * @param viewportsInfo Array of viewportInputs which each item containing `{viewportId, renderingEngineId}`
    */
   _computeToolCenter = (viewportsInfo): void => {
+    this._debugLog('_computeToolCenter:start', {
+      standalone: !!this.configuration.standalone,
+      viewportsCount: viewportsInfo?.length ?? 0,
+      toolCenter: this._formatPoint3(this.toolCenter),
+      lastValidToolCenter: this._formatPoint3(this._lastValidToolCenter),
+      ownFrameOfReferenceUID: this._getOwnFrameOfReferenceUID(),
+      linkedToolGroupIds: this.configuration.syncWithToolGroupIds,
+      viewports: this._getViewportsDebugInfo(viewportsInfo || []),
+    });
+
     if (!viewportsInfo.length) {
+      this._debugLog('_computeToolCenter:skip:no-viewports');
       return;
     }
 
@@ -546,6 +567,7 @@ class CrosshairsTool extends AnnotationTool {
     // toolGroup(s) listed in `syncWithToolGroupIds`. So the usual "at least
     // two viewports" requirement doesn't apply here.
     if (!this.configuration.standalone && viewportsInfo.length === 1) {
+      this._debugLog('_computeToolCenter:skip:not-enough-viewports');
       console.warn(
         'For crosshairs to operate, at least two viewports must be given.'
       );
@@ -602,8 +624,9 @@ class CrosshairsTool extends AnnotationTool {
         // own current camera focal point.
         if (!pulled && !this._standaloneToolCenterInitialized) {
           if (this._lastValidToolCenter) {
-            this.toolCenter = [...this._lastValidToolCenter] as Types.Point3;
-            this._standaloneToolCenterInitialized = true;
+            this._commitToolCenter(this._lastValidToolCenter, {
+              markStandaloneInitialized: true,
+            });
             this._syncStandaloneStackSlices(viewportsInfo, this.toolCenter);
           } else {
             this._initializeStandaloneToolCenterFromOwnViewport(viewportsInfo);
@@ -638,9 +661,50 @@ class CrosshairsTool extends AnnotationTool {
       return;
     }
 
+    // If this toolGroup is linked to another one (e.g. MPR <-> 2D/3D), prefer
+    // adopting an already-known external center first. This avoids a transient
+    // reset to the default/origin center while MPR cameras are still settling.
+    const pulledFromLinked = this._pullToolCenterFromLinkedToolGroups();
+    if (pulledFromLinked) {
+      this._suppressAbsoluteRecomputeUntil = Date.now() + 1200;
+      // Important for MPR initialization: a linked toolGroup can already have
+      // the desired toolCenter in state while this toolGroup's own cameras are
+      // still at their default volume-center positions. Force-apply the current
+      // center to cameras here so newly enabled MPR viewports are physically
+      // aligned to the shared center, not just storing the same point in state.
+      this.setToolCenter(this.toolCenter, /* suppressEvents = */ true);
+
+      this._debugLog('_computeToolCenter:using-linked-center', {
+        toolCenter: this._formatPoint3(this.toolCenter),
+        lastValidToolCenter: this._formatPoint3(this._lastValidToolCenter),
+      });
+      triggerAnnotationRenderForViewportIds(
+        viewportsInfo.map(({ viewportId }) => viewportId)
+      );
+      return;
+    }
+
+    const sharedCenter = this._getSharedToolCenterCandidate();
+    if (sharedCenter) {
+      this._suppressAbsoluteRecomputeUntil = Date.now() + 1200;
+      this._debugLog('_computeToolCenter:using-shared-center', {
+        sharedCenter: this._formatPoint3(sharedCenter),
+      });
+      this.setToolCenter(sharedCenter, /* suppressEvents = */ true);
+      triggerAnnotationRenderForViewportIds(
+        viewportsInfo.map(({ viewportId }) => viewportId)
+      );
+      return;
+    }
+
     this._recomputeToolCenterFromAbsoluteCameras({
       emitEvent: true,
       updateViewportCameras: true,
+    });
+
+    this._debugLog('_computeToolCenter:end', {
+      toolCenter: this._formatPoint3(this.toolCenter),
+      lastValidToolCenter: this._formatPoint3(this._lastValidToolCenter),
     });
   };
 
@@ -658,10 +722,11 @@ class CrosshairsTool extends AnnotationTool {
         renderingEngineId
       );
       if (enabledElement?.FrameOfReferenceUID) {
+        this._lastKnownFrameOfReferenceUID = enabledElement.FrameOfReferenceUID;
         return enabledElement.FrameOfReferenceUID;
       }
     }
-    return undefined;
+    return this._lastKnownFrameOfReferenceUID ?? undefined;
   };
 
   /**
@@ -732,6 +797,9 @@ class CrosshairsTool extends AnnotationTool {
     const syncWithToolGroupIds: string[] =
       this.configuration.syncWithToolGroupIds;
     if (!syncWithToolGroupIds?.length) {
+      this._debugLog(
+        '_pullToolCenterFromLinkedToolGroups:skip:no-linked-groups'
+      );
       return false;
     }
 
@@ -746,22 +814,53 @@ class CrosshairsTool extends AnnotationTool {
       }
 
       const linkedFrameOfReferenceUID =
-        linkedInstance._getOwnFrameOfReferenceUID();
+        linkedInstance._getOwnFrameOfReferenceUID() ||
+        linkedInstance._lastKnownFrameOfReferenceUID ||
+        undefined;
+      const ownFrameOfReferenceUID = this._getOwnFrameOfReferenceUID();
+
+      this._debugLog(
+        '_pullToolCenterFromLinkedToolGroups:checking-linked-group',
+        {
+          linkedToolGroupId,
+          ownFrameOfReferenceUID,
+          linkedFrameOfReferenceUID,
+          linkedToolCenter: this._formatPoint3(linkedInstance.toolCenter),
+          linkedLastValidToolCenter: this._formatPoint3(
+            linkedInstance._lastValidToolCenter
+          ),
+        }
+      );
 
       if (linkedInstance.toolCenter) {
         if (
           this._isFinitePoint3(linkedInstance.toolCenter) &&
-          !(
-            Math.abs(linkedInstance.toolCenter[0]) < 1e-3 &&
-            Math.abs(linkedInstance.toolCenter[1]) < 1e-3 &&
-            Math.abs(linkedInstance.toolCenter[2]) < 1e-3
-          )
+          !this._isNearZeroPoint3(linkedInstance.toolCenter)
         ) {
           const applied = this._applyExternalToolCenter(
             linkedInstance.toolCenter,
             linkedFrameOfReferenceUID
           );
           if (applied) {
+            this._debugLog(
+              '_pullToolCenterFromLinkedToolGroups:applied-linked-toolCenter',
+              {
+                linkedToolGroupId,
+                resultingToolCenter: this._formatPoint3(this.toolCenter),
+              }
+            );
+            return true;
+          }
+
+          if (!ownFrameOfReferenceUID) {
+            this._commitToolCenter(linkedInstance.toolCenter);
+            this._debugLog(
+              '_pullToolCenterFromLinkedToolGroups:bootstrapped-with-linked-toolCenter-no-own-for',
+              {
+                linkedToolGroupId,
+                resultingToolCenter: this._formatPoint3(this.toolCenter),
+              }
+            );
             return true;
           }
         }
@@ -770,22 +869,39 @@ class CrosshairsTool extends AnnotationTool {
       if (linkedInstance._lastValidToolCenter) {
         if (
           this._isFinitePoint3(linkedInstance._lastValidToolCenter) &&
-          !(
-            Math.abs(linkedInstance._lastValidToolCenter[0]) < 1e-3 &&
-            Math.abs(linkedInstance._lastValidToolCenter[1]) < 1e-3 &&
-            Math.abs(linkedInstance._lastValidToolCenter[2]) < 1e-3
-          )
+          !this._isNearZeroPoint3(linkedInstance._lastValidToolCenter)
         ) {
           const applied = this._applyExternalToolCenter(
             linkedInstance._lastValidToolCenter,
             linkedFrameOfReferenceUID
           );
           if (applied) {
+            this._debugLog(
+              '_pullToolCenterFromLinkedToolGroups:applied-linked-lastValidToolCenter',
+              {
+                linkedToolGroupId,
+                resultingToolCenter: this._formatPoint3(this.toolCenter),
+              }
+            );
+            return true;
+          }
+
+          if (!ownFrameOfReferenceUID) {
+            this._commitToolCenter(linkedInstance._lastValidToolCenter);
+            this._debugLog(
+              '_pullToolCenterFromLinkedToolGroups:bootstrapped-with-linked-lastValidToolCenter-no-own-for',
+              {
+                linkedToolGroupId,
+                resultingToolCenter: this._formatPoint3(this.toolCenter),
+              }
+            );
             return true;
           }
         }
       }
     }
+
+    this._debugLog('_pullToolCenterFromLinkedToolGroups:miss');
 
     return false;
   };
@@ -818,8 +934,9 @@ class CrosshairsTool extends AnnotationTool {
         continue;
       }
 
-      this.toolCenter = [...focalPoint] as Types.Point3;
-      this._standaloneToolCenterInitialized = true;
+      this._commitToolCenter(focalPoint, {
+        markStandaloneInitialized: true,
+      });
       return;
     }
   };
@@ -926,14 +1043,16 @@ class CrosshairsTool extends AnnotationTool {
     senderFrameOfReferenceUID?: string
   ): boolean => {
     if (!this._isFinitePoint3(toolCenter)) {
+      this._debugLog('_applyExternalToolCenter:skip:non-finite', {
+        toolCenter: this._formatPoint3(toolCenter),
+      });
       return false;
     }
 
-    if (
-      Math.abs(toolCenter[0]) < 1e-3 &&
-      Math.abs(toolCenter[1]) < 1e-3 &&
-      Math.abs(toolCenter[2]) < 1e-3
-    ) {
+    if (this._isNearZeroPoint3(toolCenter)) {
+      this._debugLog('_applyExternalToolCenter:skip:near-zero', {
+        toolCenter: this._formatPoint3(toolCenter),
+      });
       return false;
     }
 
@@ -941,25 +1060,35 @@ class CrosshairsTool extends AnnotationTool {
 
     const viewportsInfo = this._getViewportsInfo();
     if (!viewportsInfo.length) {
+      this._debugLog('_applyExternalToolCenter:skip:no-viewports');
       return false;
     }
 
     if (csUtils.isEqual(this.toolCenter, toolCenter, 1e-3)) {
       this._standaloneToolCenterInitialized = true;
+      this._debugLog('_applyExternalToolCenter:already-in-sync', {
+        toolCenter: this._formatPoint3(toolCenter),
+      });
       return true;
     }
 
     const ownFrameOfReferenceUID = this._getOwnFrameOfReferenceUID();
 
-    // If either side's FrameOfReferenceUID can't be determined (e.g.
-    // viewports not fully enabled yet) or they don't match (different study
-    // loaded into this toolGroup's viewport(s)), skip: this world point
-    // isn't necessarily meaningful for our own viewports' physical space.
+    // If both sides are known and they differ, skip: this world point isn't
+    // meaningful for our own viewports' physical space. If one side is
+    // temporarily unknown (e.g. linked toolGroup currently has no viewport
+    // attached during layout switch), still allow the sync using the last
+    // meaningful center.
     if (
-      !ownFrameOfReferenceUID ||
-      !senderFrameOfReferenceUID ||
+      ownFrameOfReferenceUID &&
+      senderFrameOfReferenceUID &&
       ownFrameOfReferenceUID !== senderFrameOfReferenceUID
     ) {
+      this._debugLog('_applyExternalToolCenter:skip:for-mismatch', {
+        ownFrameOfReferenceUID,
+        senderFrameOfReferenceUID,
+        toolCenter: this._formatPoint3(toolCenter),
+      });
       return false;
     }
 
@@ -977,7 +1106,9 @@ class CrosshairsTool extends AnnotationTool {
       // without this, each of those would eagerly trigger a slice change
       // (and image load) here, which can back up the main thread and make
       // the crosshair position feel like it "flies away"/lags behind.
-      this.toolCenter = toolCenter;
+      this._commitToolCenter(toolCenter, {
+        markStandaloneInitialized: true,
+      });
       this._scheduleStandaloneStackSlicesSync(viewportsInfo, toolCenter);
     } else {
       this.setToolCenter(toolCenter, /* suppressEvents = */ true);
@@ -998,6 +1129,13 @@ class CrosshairsTool extends AnnotationTool {
     triggerAnnotationRenderForViewportIds(
       viewportsInfo.map(({ viewportId }) => viewportId)
     );
+
+    this._debugLog('_applyExternalToolCenter:applied', {
+      ownFrameOfReferenceUID,
+      senderFrameOfReferenceUID,
+      toolCenter: this._formatPoint3(this.toolCenter),
+      standalone: !!this.configuration.standalone,
+    });
 
     return true;
   };
@@ -1217,18 +1355,7 @@ class CrosshairsTool extends AnnotationTool {
       this._ignoreFiredEvents = previousIgnoreFiredEvents;
     }
 
-    this.toolCenter = toolCenter;
-
-    if (
-      this._isFinitePoint3(toolCenter) &&
-      !(
-        Math.abs(toolCenter[0]) < 1e-3 &&
-        Math.abs(toolCenter[1]) < 1e-3 &&
-        Math.abs(toolCenter[2]) < 1e-3
-      )
-    ) {
-      this._lastValidToolCenter = [...toolCenter] as Types.Point3;
-    }
+    this._commitToolCenter(toolCenter);
 
     if (!suppressEvents) {
       triggerEvent(eventTarget, Events.CROSSHAIR_TOOL_CENTER_CHANGED, {
@@ -1250,6 +1377,8 @@ class CrosshairsTool extends AnnotationTool {
   addNewAnnotation = (
     evt: EventTypes.InteractionEventType
   ): CrosshairsAnnotation => {
+    this._suppressAbsoluteRecomputeUntil = 0;
+
     const eventDetail = evt.detail;
     const { element } = eventDetail;
 
@@ -1467,10 +1596,26 @@ class CrosshairsTool extends AnnotationTool {
     // within a stack uses `resetCameraNoEvent()` internally and does *not*
     // reliably fire CAMERA_MODIFIED.
     if (!this.configuration.standalone) {
-      this._recomputeToolCenterFromAbsoluteCameras({
-        emitEvent: true,
-        updateViewportCameras: false,
-      });
+      const now = Date.now();
+      if (
+        now < this._suppressAbsoluteRecomputeUntil &&
+        !state.isInteractingWithTool &&
+        !this.editData
+      ) {
+        this._debugLog(
+          'onCameraModified:skip-absolute-recompute-bootstrap-window',
+          {
+            now,
+            suppressUntil: this._suppressAbsoluteRecomputeUntil,
+            toolCenter: this._formatPoint3(this.toolCenter),
+          }
+        );
+      } else {
+        this._recomputeToolCenterFromAbsoluteCameras({
+          emitEvent: true,
+          updateViewportCameras: false,
+        });
+      }
     }
 
     // AutoPan modification
@@ -1656,12 +1801,11 @@ class CrosshairsTool extends AnnotationTool {
       if (
         !this._standaloneToolCenterInitialized ||
         !this._isFinitePoint3(this.toolCenter) ||
-        (Math.abs(this.toolCenter[0]) < 1e-3 &&
-          Math.abs(this.toolCenter[1]) < 1e-3 &&
-          Math.abs(this.toolCenter[2]) < 1e-3)
+        this._isNearZeroPoint3(this.toolCenter)
       ) {
-        this.toolCenter = [...newFocalPoint] as Types.Point3;
-        this._standaloneToolCenterInitialized = true;
+        this._commitToolCenter(newFocalPoint, {
+          markStandaloneInitialized: true,
+        });
       }
 
       triggerAnnotationRenderForViewportIds([viewportId]);
@@ -1709,8 +1853,9 @@ class CrosshairsTool extends AnnotationTool {
       this.toolCenter[2] + shift[2],
     ];
 
-    this.toolCenter = newToolCenter;
-    this._standaloneToolCenterInitialized = true;
+    this._commitToolCenter(newToolCenter, {
+      markStandaloneInitialized: true,
+    });
 
     // Keep any *other* StackViewport(s) in this same toolGroup in step too
     // (excluding the one that was just scrolled — it's already showing the
@@ -3140,6 +3285,8 @@ class CrosshairsTool extends AnnotationTool {
   };
 
   _activateModify = (element) => {
+    this._suppressAbsoluteRecomputeUntil = 0;
+
     this._syncVolumeListenersWithToolGroup();
     this._recomputeToolCenterFromAbsoluteCameras({
       emitEvent: false,
@@ -3248,7 +3395,9 @@ class CrosshairsTool extends AnnotationTool {
           this.toolCenter[1] + delta[1],
           this.toolCenter[2] + delta[2],
         ];
-        this.toolCenter = newToolCenter;
+        this._commitToolCenter(newToolCenter, {
+          markStandaloneInitialized: true,
+        });
 
         // If this toolGroup has other (StackViewport) viewports besides the
         // one being dragged, auto-scroll them to the slice closest to the
@@ -4128,6 +4277,152 @@ class CrosshairsTool extends AnnotationTool {
     return `${renderingEngineId}::${viewportId}`;
   };
 
+  _isDebugEnabled = (): boolean => {
+    return (
+      !!this.configuration?.debug ||
+      !!(globalThis as { __CROSSHAIRS_DEBUG__?: boolean }).__CROSSHAIRS_DEBUG__
+    );
+  };
+
+  _debugLog = (message: string, payload?: unknown): void => {
+    if (!this._isDebugEnabled()) {
+      return;
+    }
+
+    if (payload !== undefined) {
+      console.info(`[CrosshairsDebug:${this.toolGroupId}] ${message}`, payload);
+    } else {
+      console.info(`[CrosshairsDebug:${this.toolGroupId}] ${message}`);
+    }
+  };
+
+  _formatPoint3 = (point: Types.Point3 | null | undefined): string | null => {
+    if (!point || point.length !== 3) {
+      return null;
+    }
+
+    return point.map((v) => Number(v).toFixed(3)).join(',');
+  };
+
+  _getViewportsDebugInfo = (
+    viewportsInfo: { viewportId: string; renderingEngineId: string }[]
+  ): Array<{
+    viewportId: string;
+    renderingEngineId: string;
+    enabled: boolean;
+    frameOfReferenceUID?: string;
+    focalPoint?: string | null;
+    viewPlaneNormal?: string | null;
+  }> => {
+    return viewportsInfo.map(({ viewportId, renderingEngineId }) => {
+      const enabledElement = getEnabledElementByIds(
+        viewportId,
+        renderingEngineId
+      );
+      const viewport = enabledElement?.viewport;
+      const camera = viewport ? getViewportICamera(viewport) : null;
+
+      return {
+        viewportId,
+        renderingEngineId,
+        enabled: !!enabledElement,
+        frameOfReferenceUID: enabledElement?.FrameOfReferenceUID,
+        focalPoint: camera?.focalPoint
+          ? this._formatPoint3(camera.focalPoint as Types.Point3)
+          : null,
+        viewPlaneNormal: camera?.viewPlaneNormal
+          ? this._formatPoint3(camera.viewPlaneNormal as Types.Point3)
+          : null,
+      };
+    });
+  };
+
+  _isNearZeroPoint3 = (point: Types.Point3, epsilon = 1e-3): boolean => {
+    return (
+      Math.abs(point[0]) < epsilon &&
+      Math.abs(point[1]) < epsilon &&
+      Math.abs(point[2]) < epsilon
+    );
+  };
+
+  _commitToolCenter = (
+    point: Types.Point3,
+    {
+      markStandaloneInitialized = false,
+    }: { markStandaloneInitialized?: boolean } = {}
+  ): void => {
+    this.toolCenter = [...point] as Types.Point3;
+
+    if (this._isFinitePoint3(point) && !this._isNearZeroPoint3(point)) {
+      this._lastValidToolCenter = [...point] as Types.Point3;
+      this._storeSharedToolCenter(point);
+    }
+
+    if (markStandaloneInitialized) {
+      this._standaloneToolCenterInitialized = true;
+    }
+  };
+
+  _storeSharedToolCenter = (point: Types.Point3): void => {
+    if (!this._isFinitePoint3(point) || this._isNearZeroPoint3(point)) {
+      return;
+    }
+
+    const pointCopy = [...point] as Types.Point3;
+    const frameOfReferenceUID = this._getOwnFrameOfReferenceUID();
+    if (frameOfReferenceUID) {
+      CrosshairsTool._sharedCenterByFrameOfReference.set(
+        frameOfReferenceUID,
+        pointCopy
+      );
+    }
+
+    if (this._lastKnownFrameOfReferenceUID) {
+      CrosshairsTool._sharedCenterByFrameOfReference.set(
+        this._lastKnownFrameOfReferenceUID,
+        pointCopy
+      );
+    }
+
+    CrosshairsTool._sharedLastCenter = pointCopy;
+  };
+
+  _getSharedToolCenterCandidate = (): Types.Point3 | null => {
+    const frameOfReferenceUID = this._getOwnFrameOfReferenceUID();
+
+    if (frameOfReferenceUID) {
+      const byFrame =
+        CrosshairsTool._sharedCenterByFrameOfReference.get(frameOfReferenceUID);
+      if (byFrame) {
+        return [...byFrame] as Types.Point3;
+      }
+    }
+
+    if (this._lastKnownFrameOfReferenceUID) {
+      const byLastKnown = CrosshairsTool._sharedCenterByFrameOfReference.get(
+        this._lastKnownFrameOfReferenceUID
+      );
+      if (byLastKnown) {
+        return [...byLastKnown] as Types.Point3;
+      }
+    }
+
+    if (CrosshairsTool._sharedCenterByFrameOfReference.size === 1) {
+      const onlyCenter = CrosshairsTool._sharedCenterByFrameOfReference
+        .values()
+        .next().value;
+      if (onlyCenter) {
+        return [...onlyCenter] as Types.Point3;
+      }
+    }
+
+    if (CrosshairsTool._sharedLastCenter) {
+      return [...CrosshairsTool._sharedLastCenter] as Types.Point3;
+    }
+
+    return null;
+  };
+
   _isFinitePoint3 = (point: Types.Point3): boolean => {
     if (!point || point.length !== 3) {
       return false;
@@ -4391,6 +4686,15 @@ class CrosshairsTool extends AnnotationTool {
 
   _calculateToolCenterFromAbsoluteCameras = (): Types.Point3 | null => {
     const viewportsInfo = this._getViewportsInfo();
+    const referenceCenter =
+      this._isFinitePoint3(this.toolCenter) &&
+      !this._isNearZeroPoint3(this.toolCenter)
+        ? ([...this.toolCenter] as Types.Point3)
+        : this._isFinitePoint3(this._lastValidToolCenter as Types.Point3) &&
+            !this._isNearZeroPoint3(this._lastValidToolCenter as Types.Point3)
+          ? ([...(this._lastValidToolCenter as Types.Point3)] as Types.Point3)
+          : null;
+
     const uniquePlanes: Array<{
       normal: Types.Point3;
       point: Types.Point3;
@@ -4425,14 +4729,40 @@ class CrosshairsTool extends AnnotationTool {
 
       vec3.normalize(normal, normal);
 
-      const alreadyTracked = uniquePlanes.some(
+      const existingPlaneIndex = uniquePlanes.findIndex(
         (plane) =>
           csUtils.isEqual(plane.normal, normal, 1e-3) ||
           csUtils.isOpposite(plane.normal, normal, 1e-3)
       );
 
-      if (!alreadyTracked) {
+      if (existingPlaneIndex === -1) {
         uniquePlanes.push({ normal, point });
+        return;
+      }
+
+      if (!referenceCenter) {
+        return;
+      }
+
+      const existingPlane = uniquePlanes[existingPlaneIndex];
+      const existingDistanceToReference = Math.abs(
+        vtkMath.dot(existingPlane.normal, [
+          referenceCenter[0] - existingPlane.point[0],
+          referenceCenter[1] - existingPlane.point[1],
+          referenceCenter[2] - existingPlane.point[2],
+        ])
+      );
+
+      const candidateDistanceToReference = Math.abs(
+        vtkMath.dot(existingPlane.normal, [
+          referenceCenter[0] - point[0],
+          referenceCenter[1] - point[1],
+          referenceCenter[2] - point[2],
+        ])
+      );
+
+      if (candidateDistanceToReference < existingDistanceToReference) {
+        existingPlane.point = point;
       }
     });
 
@@ -4494,23 +4824,83 @@ class CrosshairsTool extends AnnotationTool {
   } = {}): Types.Point3 | null => {
     let toolCenter = this._calculateToolCenterFromAbsoluteCameras();
 
+    // During viewport/toolGroup re-wiring (notably when enabling MPR), camera
+    // geometry can be momentarily incomplete and produce an origin-like center.
+    // If we already have a meaningful center, keep it instead of clobbering it
+    // with [0,0,0]-ish values.
+    const currentCenterIsMeaningful =
+      this._isFinitePoint3(this.toolCenter) &&
+      !this._isNearZeroPoint3(this.toolCenter);
+    const lastValidCenterIsMeaningful =
+      this._isFinitePoint3(this._lastValidToolCenter as Types.Point3) &&
+      !this._isNearZeroPoint3(this._lastValidToolCenter as Types.Point3);
+
+    if (toolCenter && this._isNearZeroPoint3(toolCenter)) {
+      this._debugLog(
+        '_recomputeToolCenterFromAbsoluteCameras:calculated-near-zero',
+        {
+          calculatedToolCenter: this._formatPoint3(toolCenter),
+          currentCenter: this._formatPoint3(this.toolCenter),
+          lastValidToolCenter: this._formatPoint3(this._lastValidToolCenter),
+        }
+      );
+
+      if (currentCenterIsMeaningful) {
+        toolCenter = [...this.toolCenter] as Types.Point3;
+      } else if (lastValidCenterIsMeaningful) {
+        toolCenter = [
+          ...(this._lastValidToolCenter as Types.Point3),
+        ] as Types.Point3;
+      } else {
+        const sharedCenter = this._getSharedToolCenterCandidate();
+        if (sharedCenter) {
+          toolCenter = sharedCenter;
+        }
+      }
+    }
+
     if (!toolCenter && this._lastValidToolCenter) {
       toolCenter = [...this._lastValidToolCenter] as Types.Point3;
     }
 
     if (!toolCenter) {
+      const sharedCenter = this._getSharedToolCenterCandidate();
+      if (sharedCenter) {
+        toolCenter = sharedCenter;
+      }
+    }
+
+    if (!toolCenter) {
+      this._debugLog('_recomputeToolCenterFromAbsoluteCameras:skip:no-center');
       return null;
     }
 
     const hasChanged = !csUtils.isEqual(this.toolCenter, toolCenter, 1e-3);
     if (!hasChanged) {
+      this._debugLog('_recomputeToolCenterFromAbsoluteCameras:no-change', {
+        toolCenter: this._formatPoint3(toolCenter),
+      });
       return toolCenter;
     }
 
     if (updateViewportCameras) {
+      this._debugLog(
+        '_recomputeToolCenterFromAbsoluteCameras:apply-with-camera-update',
+        {
+          toolCenter: this._formatPoint3(toolCenter),
+          emitEvent,
+        }
+      );
       this.setToolCenter(toolCenter, !emitEvent);
     } else {
-      this.toolCenter = toolCenter;
+      this._debugLog(
+        '_recomputeToolCenterFromAbsoluteCameras:apply-state-only',
+        {
+          toolCenter: this._formatPoint3(toolCenter),
+          emitEvent,
+        }
+      );
+      this._commitToolCenter(toolCenter);
 
       if (emitEvent) {
         triggerEvent(eventTarget, Events.CROSSHAIR_TOOL_CENTER_CHANGED, {
