@@ -10,6 +10,17 @@ import PlanarRotateTool from './PlanarRotateTool';
 import ZoomTool from './ZoomTool';
 import MIPJumpToClickTool from './MIPJumpToClickTool';
 import CrosshairsTool from './CrosshairsTool';
+import {
+  getWorldPointManager,
+  resetWorldPointManager,
+} from './WorldPointManager';
+export type {
+  WorldPointSubscriber,
+  WorldPointState,
+  WorldPointManagerConfig,
+  CameraPlane,
+  ViewportType as WorldPointViewportType,
+} from './WorldPointManager';
 import MagnifyTool from './MagnifyTool';
 import AdvancedMagnifyTool from './AdvancedMagnifyTool';
 import ReferenceLinesTool from './ReferenceLinesTool';
@@ -87,6 +98,8 @@ export {
   ReferenceCursors,
   // Annotation Tools
   CrosshairsTool,
+  getWorldPointManager,
+  resetWorldPointManager,
   ReferenceLinesTool,
   OverlayGridTool,
   SegmentationIntersectionTool,

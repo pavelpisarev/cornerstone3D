@@ -14,6 +14,7 @@ import {
   triggerEvent,
   eventTarget,
   StackViewport,
+  VolumeViewport3D,
 } from '@cornerstonejs/core';
 
 import {
@@ -45,6 +46,10 @@ import {
   getSlabThicknessOrDefault,
   jumpToFocalPoint,
 } from '../utilities/genericViewportToolHelpers';
+import {
+  getWorldPointManager,
+  type CameraPlane,
+} from './WorldPointManager';
 
 import * as lineSegment from '../utilities/math/line';
 import type {
@@ -64,12 +69,9 @@ import triggerAnnotationRenderForViewportIds from '../utilities/triggerAnnotatio
 const { RENDERING_DEFAULTS } = CONSTANTS;
 
 /**
- * Displayed canvas size for crosshairs geometry. Native ("next") viewports render to
- * a separate visible canvas (e.g. the CPU canvas); their `viewport.canvas` is the
- * hidden cornerstone-canvas (display:none -> clientWidth/clientHeight === 0), which
- * would collapse the reference-line extents. worldToCanvas already returns coordinates
- * in the element's displayed space, so use the element size for native; legacy keeps
- * the canvas size (byte-identical).
+ * Displayed canvas size for crosshairs geometry. Native viewports use the
+ * element size (their `viewport.canvas` is hidden -> 0x0); legacy uses the
+ * canvas size.
  */
 function getDisplayedCanvasSize(viewport): {
   clientWidth: number;
@@ -134,8 +136,6 @@ const OPERATION = {
  */
 class CrosshairsTool extends AnnotationTool {
   static toolName;
-  static _sharedCenterByFrameOfReference = new Map<string, Types.Point3>();
-  static _sharedLastCenter: Types.Point3 | null = null;
   static minimalModeExamples = new Map<
     string,
     {
@@ -148,8 +148,21 @@ class CrosshairsTool extends AnnotationTool {
     ['Minimal 80px', { enabled: true, lineLengthInPx: 80 }],
   ]);
 
-  toolCenter: Types.Point3 = [0, 0, 0]; // NOTE: it is assumed that all the active/linked viewports share the same crosshair center.
-  // This because the rotation operation rotates also all the other active/intersecting reference lines of the same angle
+  _localToolCenter: Types.Point3 = [0, 0, 0];
+  get toolCenter(): Types.Point3 {
+    const forUID = this._getOwnFrameOfReferenceUID();
+    if (forUID) {
+      const manager = getWorldPointManager();
+      const point = manager.getPoint(forUID);
+      if (point) {
+        return point;
+      }
+    }
+    return this._localToolCenter;
+  }
+  set toolCenter(point: Types.Point3) {
+    this._localToolCenter = [...point] as Types.Point3;
+  }
   _lastValidToolCenter: Types.Point3 | null = null;
   _lastKnownFrameOfReferenceUID: string | null = null;
   _getReferenceLineColor?: (viewportId: string) => string;
@@ -168,52 +181,21 @@ class CrosshairsTool extends AnnotationTool {
   _elementEnabledListener: EventListener | null = null;
   _imageRenderedListener: EventListener | null = null;
   _ignoreFiredEvents = false;
-  // Listener bridging this instance's tool center with other toolGroups'
-  // CrosshairsTool instances, see `configuration.syncWithToolGroupIds`.
-  _onExternalToolCenterChanged: EventListener | null = null;
-  // Whether this `standalone` instance's tool center has been set to
-  // something meaningful yet (either pulled/received from a linked
-  // toolGroup, or defaulted to this toolGroup's own viewport center). Used
-  // to avoid clobbering an already-synced value with the own-viewport
-  // fallback on a later re-init (e.g. a second viewport being added).
-  _standaloneToolCenterInitialized = false;
-  // Snapshot of this toolGroup's own viewport ids (see `_computeToolCenter`),
-  // used to detect a *genuine* membership change (as opposed to a redundant
-  // re-add of the same viewport(s)) before attempting a (re-)pull.
-  _lastStandaloneViewportIdsKey: string | null = null;
-  // Handle for the background retry timer, see `_scheduleStandaloneSyncRetry`.
-  _standaloneSyncRetryHandle: ReturnType<typeof setTimeout> | null = null;
-  _standaloneSyncRetryAttempts = 0;
-  // Handles for `_scheduleStandaloneRenderRetries`' animation-frame retries.
-  _standaloneRenderRetryHandles: ReturnType<typeof setTimeout>[] = [];
-  // Raw STACK_NEW_IMAGE listeners (one per own StackViewport), used to
-  // detect slice/scroll changes for `standalone` toolGroups — see
-  // `_syncStandaloneStackImageListeners`/`_handleStandaloneStackNewImage`.
-  _standaloneStackImageListeners: Map<
+  // Raw STACK_NEW_IMAGE listeners (one per StackViewport) to detect slice/scroll changes.
+  _stackImageListeners: Map<
     string,
     { element: HTMLDivElement; listener: EventListener }
   > = new Map();
-  // Own StackViewports for which we've already processed at least one real
-  // (loaded) image — see `_handleStandaloneStackNewImage`'s "first image
-  // seen" handling.
-  _standaloneSeenViewports: Set<string> = new Set();
-  // Image index we last programmatically requested via
-  // `_syncStandaloneStackSlices`'s `setImageIdIndex()` call, per own
-  // StackViewport — since that call resolves asynchronously, this is how
-  // `_handleStandaloneStackNewImage` recognizes (and ignores) the resulting
-  // STACK_NEW_IMAGE as our own doing rather than a fresh user scroll.
-  _standalonePendingProgrammaticIndex: Map<string, number> = new Map();
-  // Coalescing state for `_scheduleStandaloneStackSlicesSync`.
-  _standaloneStackSlicesSyncRafHandle: number | null = null;
-  _pendingStandaloneStackSlicesSync: {
-    viewportsInfo: { viewportId: string; renderingEngineId: string }[];
-    worldPoint: Types.Point3;
-    excludeKey?: string;
-  } | null = null;
-  // Short bootstrap window to ignore camera-driven absolute center recompute
-  // noise while MPR viewports are being (re)created and cameras are still
-  // settling to defaults.
-  _suppressAbsoluteRecomputeUntil = 0;
+  // StackViewports for which at least one real (loaded) image has been processed.
+  _seenStackViewports: Set<string> = new Set();
+  // Slice index last programmatically requested via setImageIdIndex() per
+  // StackViewport; used to recognize and ignore the resulting async
+  // STACK_NEW_IMAGE as our own doing (feedback-loop guard).
+  _pendingProgrammaticSliceIndex: Map<string, number> = new Map();
+  // Debounce handle: coalesces rapid TOOLGROUP_VIEWPORT_ADDED events (e.g. MPR
+  // triad) into a single _computeToolCenter call once cameras have settled.
+  _debouncedRecomputeHandle: ReturnType<typeof setTimeout> | null = null;
+  _debounceDelayMs = 150;
 
   constructor(
     toolProps: PublicToolProps = {},
@@ -230,12 +212,8 @@ class CrosshairsTool extends AnnotationTool {
           x: null,
           y: null,
         },
-        // Auto pan is a configuration which will update pan
-        // other viewports in the toolGroup if the center of the crosshairs
-        // is outside of the viewport. This might be useful for the case
-        // when the user is scrolling through an image (usually in the zoomed view)
-        // and the crosshairs will eventually get outside of the viewport for
-        // the other viewports.
+        // Pans other viewports in the toolGroup when the crosshairs center
+        // moves outside their bounds (e.g. while scrolling a zoomed view).
         autoPan: {
           enabled: false,
           panSize: 10,
@@ -271,18 +249,11 @@ class CrosshairsTool extends AnnotationTool {
           color: 'rgba(255, 255, 0, 0.5)',
           size: 2,
         },
-        // Renders a grabbable circle handle at the crosshairs' tool center
-        // (the point where all reference lines intersect). Since the area
-        // right around the tool center is usually kept clear of reference
-        // lines (see referenceLinesCenterGapRadius/Ratio), this handle gives
-        // users something to click-and-drag in order to translate the whole
-        // crosshair (all linked viewports), which otherwise would only be
-        // possible by dragging one of the reference lines directly. This
-        // works in both Active and Passive tool modes.
+        // Grabbable circle handle at the tool center for translating the whole
+        // crosshair (all linked viewports). Works in Active and Passive modes.
         centerHandle: {
           enabled: true,
-          // Visual + hit-test radius (in canvas pixels) of the center handle.
-          // Falls back to `handleRadius` when not provided.
+          // Visual + hit-test radius (canvas px). Falls back to `handleRadius`.
           radius: null,
           color: null,
         },
@@ -292,35 +263,6 @@ class CrosshairsTool extends AnnotationTool {
           handleRadius: 9,
           referenceLinesCenterGapRatio: 0.05,
         },
-        // `standalone` is meant for toolGroups that do NOT contain a set of
-        // mutually-orthogonal MPR reformat viewports (e.g. a toolGroup with
-        // just a single 3D volume-render viewport, or an otherwise unrelated
-        // 2D viewport). In this mode:
-        // - the tool does not require >= 2 viewports and never computes the
-        //   tool center via plane-intersection geometry;
-        // - no reference lines / rotation / slab-thickness handles are shown
-        //   (there is nothing meaningful to compute them from) — only the
-        //   `centerHandle` circle is rendered/draggable;
-        // - translating this toolGroup's own viewport(s) to a new tool center
-        //   is done via a full rigid pan (see `setToolCenter`), instead of
-        //   projecting the delta onto the viewport's own view plane normal
-        //   (which only makes sense for an orthogonal reformat plane).
-        // Combine with `syncWithToolGroupIds` to mirror the tool center
-        // to/from other (MPR) toolGroups that cannot share this toolGroup,
-        // since cornerstone3D only allows a viewport to belong to a single
-        // toolGroup.
-        standalone: false,
-        // List of other toolGroupIds whose CrosshairsTool instance this
-        // instance should stay in sync with. Whenever this instance's own
-        // tool center changes (drag, jump, ...), it is broadcast via the
-        // `CROSSHAIR_TOOL_CENTER_CHANGED` event; any other CrosshairsTool
-        // instance listing this instance's toolGroupId in its own
-        // `syncWithToolGroupIds` will pick up the change (and vice versa),
-        // regardless of which toolGroup/renderingEngine their viewports
-        // belong to. Updates are only applied if the receiving toolGroup's
-        // viewports share the same FrameOfReferenceUID as the sender (so
-        // having multiple, unrelated studies open at once is harmless).
-        syncWithToolGroupIds: [],
         // Emits verbose console logs for tool-center resolution/sync.
         // Can also be enabled globally via `globalThis.__CROSSHAIRS_DEBUG__ = true`.
         debug: false,
@@ -403,6 +345,8 @@ class CrosshairsTool extends AnnotationTool {
 
     addAnnotation(annotation, element);
 
+    this._registerViewportWithManager(renderingEngineId, viewportId);
+
     const { clientWidth, clientHeight } = getDisplayedCanvasSize(viewport);
     return {
       normal: viewPlaneNormal,
@@ -420,9 +364,9 @@ class CrosshairsTool extends AnnotationTool {
     this._unbindToolGroupViewportListeners();
     this._clearAllVolumeListenersAndViewportState();
     this._bindToolGroupViewportListeners();
+    this._registerAllViewportsWithManager();
     this._syncVolumeListenersWithToolGroup();
     this._computeToolCenter(this._getViewportsInfo());
-    this._bindCrossToolGroupSyncListener();
   };
 
   onSetToolActive() {
@@ -440,16 +384,12 @@ class CrosshairsTool extends AnnotationTool {
   onSetToolDisabled() {
     const viewportsInfo = this._getViewportsInfo();
 
+    this._unregisterAllViewportsFromManager();
     this._unbindToolGroupViewportListeners();
     this._clearAllVolumeListenersAndViewportState();
-    this._unbindCrossToolGroupSyncListener();
-    this._unbindStandaloneStackImageListeners();
-    this._clearStandaloneSyncRetry();
-    this._cancelStandaloneStackSlicesSync();
-    this._cancelStandaloneRenderRetries();
+    this._unbindStackImageListeners();
+    this._cancelDebouncedRecompute();
     this._ignoreFiredEvents = false;
-    this._standaloneToolCenterInitialized = false;
-    this._lastStandaloneViewportIdsKey = null;
     this.editData = null;
     state.isInteractingWithTool = false;
 
@@ -496,9 +436,8 @@ class CrosshairsTool extends AnnotationTool {
       const resetRotation = true;
       const suppressEvents = true;
       if (csUtils.isGenericViewport(viewport)) {
-        // Native PLANAR_NEXT has no resetCamera/resetSlabThickness; resetViewState
-        // resets pan/zoom/orientation/flip (slice/navigation is preserved and there
-        // is no slab concept). Wrapped by the caller's _ignoreFiredEvents guard.
+        // Native PLANAR_NEXT has no resetCamera/resetSlabThickness; use
+        // resetViewState (slice/navigation is preserved, no slab concept).
         viewport.resetViewState({
           resetPan,
           resetZoom,
@@ -546,12 +485,10 @@ class CrosshairsTool extends AnnotationTool {
    */
   _computeToolCenter = (viewportsInfo): void => {
     this._debugLog('_computeToolCenter:start', {
-      standalone: !!this.configuration.standalone,
       viewportsCount: viewportsInfo?.length ?? 0,
       toolCenter: this._formatPoint3(this.toolCenter),
       lastValidToolCenter: this._formatPoint3(this._lastValidToolCenter),
       ownFrameOfReferenceUID: this._getOwnFrameOfReferenceUID(),
-      linkedToolGroupIds: this.configuration.syncWithToolGroupIds,
       viewports: this._getViewportsDebugInfo(viewportsInfo || []),
     });
 
@@ -560,136 +497,26 @@ class CrosshairsTool extends AnnotationTool {
       return;
     }
 
-    // `standalone` toolGroups (see configuration doc) don't need a set of
-    // mutually-orthogonal reformat viewports: they don't compute their own
-    // tool center via plane-intersection geometry (there is nothing to
-    // intersect), they just mirror whatever tool center is broadcast by the
-    // toolGroup(s) listed in `syncWithToolGroupIds`. So the usual "at least
-    // two viewports" requirement doesn't apply here.
-    if (!this.configuration.standalone && viewportsInfo.length === 1) {
-      this._debugLog('_computeToolCenter:skip:not-enough-viewports');
-      console.warn(
-        'For crosshairs to operate, at least two viewports must be given.'
-      );
-      return;
-    }
-
     viewportsInfo.forEach((viewportInfo) => {
       this.initializeViewport(viewportInfo);
     });
 
-    if (this.configuration.standalone) {
-      // Keep the per-viewport STACK_NEW_IMAGE listeners (reverse-sync for
-      // scrolling — see `_handleStandaloneStackNewImage`) up to date with
-      // the current viewport membership. Cheap/idempotent to call here on
-      // every (re-)init.
-      this._syncStandaloneStackImageListeners(viewportsInfo);
+    // Keep the per-viewport STACK_NEW_IMAGE listeners (reverse-sync for
+    // scrolling — see `_handleStackNewImage`) in sync with the current
+    // viewport membership. Cheap/idempotent; only binds to StackViewports.
+    this._syncStackImageListeners(viewportsInfo);
 
-      // No geometry to compute. This runs both on initial activation and
-      // whenever a viewport is (re-)added to this toolGroup (see
-      // `_bindToolGroupViewportListeners`'s TOOLGROUP_VIEWPORT_ADDED
-      // handler, which fires on *every* call to `toolGroup.addViewport()`
-      // — including redundant re-adds of a viewport that was already
-      // there, e.g. from an app effect re-running).
-      //
-      // We only (re-)pull when this toolGroup's own viewport *membership*
-      // genuinely changed (tracked via `_lastStandaloneViewportIdsKey`):
-      // re-pulling on every redundant TOOLGROUP_VIEWPORT_ADDED (same
-      // viewports, nothing new) would keep resetting the tool center back
-      // to the linked toolGroup's last-known value, clobbering any local
-      // drag/scroll the user did in the meantime. But a genuine membership
-      // change (e.g. this is the very first viewport, or a second one just
-      // joined) IS worth a fresh pull attempt, even if we already have a
-      // (possibly fallback-derived) tool center — the linked toolGroup may
-      // have become reachable/ready since our last attempt.
-      const viewportIdsKey = viewportsInfo
-        .map(({ renderingEngineId, viewportId }) =>
-          this._toViewportKey(renderingEngineId, viewportId)
-        )
-        .sort()
-        .join('|');
-      const viewportMembershipChanged =
-        viewportIdsKey !== this._lastStandaloneViewportIdsKey;
-      this._lastStandaloneViewportIdsKey = viewportIdsKey;
-
-      if (viewportMembershipChanged) {
-        const pulled = this._pullToolCenterFromLinkedToolGroups();
-
-        // If there is nothing to sync with yet (no `syncWithToolGroupIds`
-        // configured, or the linked toolGroup isn't reachable/compatible
-        // yet — e.g. this is a pure standalone 2D/3D viewer with no MPR
-        // crosshair at all, or MPR just hasn't computed its own center
-        // yet), fall back to the last known valid tool center (preserved
-        // across layout switches) before falling back to this viewport's
-        // own current camera focal point.
-        if (!pulled && !this._standaloneToolCenterInitialized) {
-          if (this._lastValidToolCenter) {
-            this._commitToolCenter(this._lastValidToolCenter, {
-              markStandaloneInitialized: true,
-            });
-            this._syncStandaloneStackSlices(viewportsInfo, this.toolCenter);
-          } else {
-            this._initializeStandaloneToolCenterFromOwnViewport(viewportsInfo);
-          }
-        }
-
-        // If nothing worked this time (linked toolGroup not ready yet),
-        // keep retrying for a little while in the background instead of
-        // requiring the user to interact with something first.
-        if (!pulled) {
-          this._scheduleStandaloneSyncRetry();
-        }
-      }
-
-      // Whether or not a pull/fallback above found anything, request a
-      // redraw so the center handle appears (or stays in sync) immediately
-      // - this matters e.g. for a newly-added second viewport in this same
-      // toolGroup, which needs to show the already-known tool center right
-      // away rather than waiting for the next drag/sync elsewhere.
-      const idsToRender = viewportsInfo.map(({ viewportId }) => viewportId);
-      triggerAnnotationRenderForViewportIds(idsToRender);
-      // Belt-and-suspenders: a just-added viewport's element may not be
-      // fully registered with the annotation rendering engine at this
-      // exact synchronous instant (viewport/toolGroup wiring can outrace
-      // it), in which case the render request above is silently dropped
-      // (in addition to the ELEMENT_ENABLED listener, which covers the
-      // case where the element becomes available *after* this point). A
-      // couple of extra animation-frame retries cheaply cover any other
-      // ordering gap without requiring an unrelated interaction to "kick"
-      // a redraw.
-      this._scheduleStandaloneRenderRetries(idsToRender);
-      return;
-    }
-
-    // If this toolGroup is linked to another one (e.g. MPR <-> 2D/3D), prefer
-    // adopting an already-known external center first. This avoids a transient
-    // reset to the default/origin center while MPR cameras are still settling.
-    const pulledFromLinked = this._pullToolCenterFromLinkedToolGroups();
-    if (pulledFromLinked) {
-      this._suppressAbsoluteRecomputeUntil = Date.now() + 1200;
-      // Important for MPR initialization: a linked toolGroup can already have
-      // the desired toolCenter in state while this toolGroup's own cameras are
-      // still at their default volume-center positions. Force-apply the current
-      // center to cameras here so newly enabled MPR viewports are physically
-      // aligned to the shared center, not just storing the same point in state.
-      this.setToolCenter(this.toolCenter, /* suppressEvents = */ true);
-
-      this._debugLog('_computeToolCenter:using-linked-center', {
-        toolCenter: this._formatPoint3(this.toolCenter),
-        lastValidToolCenter: this._formatPoint3(this._lastValidToolCenter),
-      });
-      triggerAnnotationRenderForViewportIds(
-        viewportsInfo.map(({ viewportId }) => viewportId)
-      );
-      return;
-    }
-
-    const sharedCenter = this._getSharedToolCenterCandidate();
+    // Every viewport is a subscriber to the shared point of its
+    // FrameOfReferenceUID. Adopt the manager's point if it has one, else reuse
+    // the last-known-valid center, else initialize from the own focal point.
+    const forUID = this._getOwnFrameOfReferenceUID();
+    const manager = getWorldPointManager();
+    const sharedCenter = forUID ? manager.getPoint(forUID) : null;
     if (sharedCenter) {
-      this._suppressAbsoluteRecomputeUntil = Date.now() + 1200;
-      this._debugLog('_computeToolCenter:using-shared-center', {
+      this._debugLog('_computeToolCenter:using-manager-point', {
         sharedCenter: this._formatPoint3(sharedCenter),
       });
+      this._commitToolCenter(sharedCenter);
       this.setToolCenter(sharedCenter, /* suppressEvents = */ true);
       triggerAnnotationRenderForViewportIds(
         viewportsInfo.map(({ viewportId }) => viewportId)
@@ -697,10 +524,24 @@ class CrosshairsTool extends AnnotationTool {
       return;
     }
 
-    this._recomputeToolCenterFromAbsoluteCameras({
+    // 2+ orthogonal viewports: derive the center from their camera plane
+    // intersection. Returns null for a single viewport (falls through below).
+    const recomputed = this._recomputeToolCenterFromAbsoluteCameras({
       emitEvent: true,
       updateViewportCameras: true,
     });
+
+    if (!recomputed) {
+      if (this._lastValidToolCenter) {
+        this._commitToolCenter(this._lastValidToolCenter);
+        this._syncStackSlices(viewportsInfo, this.toolCenter);
+      } else {
+        this._initializeToolCenterFromOwnViewport(viewportsInfo);
+      }
+      triggerAnnotationRenderForViewportIds(
+        viewportsInfo.map(({ viewportId }) => viewportId)
+      );
+    }
 
     this._debugLog('_computeToolCenter:end', {
       toolCenter: this._formatPoint3(this.toolCenter),
@@ -709,10 +550,8 @@ class CrosshairsTool extends AnnotationTool {
   };
 
   /**
-   * Returns the FrameOfReferenceUID shared by this toolGroup's own viewports
-   * (all crosshairs viewports are assumed/required to share one), or
-   * `undefined` if it cannot be determined (e.g. no viewport currently
-   * enabled).
+   * Returns the FrameOfReferenceUID shared by this toolGroup's viewports, or
+   * the last-known one / undefined if none is currently determinable.
    */
   _getOwnFrameOfReferenceUID = (): string | undefined => {
     const viewportsInfo = this._getViewportsInfo();
@@ -730,193 +569,10 @@ class CrosshairsTool extends AnnotationTool {
   };
 
   /**
-   * Subscribes to `CROSSHAIR_TOOL_CENTER_CHANGED` events fired by other
-   * CrosshairsTool instances (i.e. instances belonging to a different
-   * toolGroup), so that this instance's tool center can be kept in sync with
-   * them. See `configuration.syncWithToolGroupIds`.
+   * Final fallback: initializes the shared tool center from the own
+   * viewport's camera focal point (defined for every viewport type).
    */
-  _bindCrossToolGroupSyncListener = (): void => {
-    this._unbindCrossToolGroupSyncListener();
-
-    const syncWithToolGroupIds: string[] =
-      this.configuration.syncWithToolGroupIds;
-    if (!syncWithToolGroupIds?.length) {
-      return;
-    }
-
-    this._onExternalToolCenterChanged = ((evt: CustomEvent) => {
-      const { toolGroupId, toolCenter, FrameOfReferenceUID } = evt.detail;
-
-      // Ignore updates from toolGroups we are not configured to follow
-      // (also naturally excludes echoes of events we fired ourselves, since
-      // a toolGroup should not list its own id).
-      if (
-        toolGroupId === this.toolGroupId ||
-        !syncWithToolGroupIds.includes(toolGroupId)
-      ) {
-        return;
-      }
-
-      this._applyExternalToolCenter(toolCenter, FrameOfReferenceUID);
-    }) as EventListener;
-
-    eventTarget.addEventListener(
-      Events.CROSSHAIR_TOOL_CENTER_CHANGED,
-      this._onExternalToolCenterChanged
-    );
-
-    // Immediately adopt the current tool center of any already-active linked
-    // toolGroup, instead of waiting for its next move, so the center handle
-    // doesn't sit at a stale/default position after (re)activation.
-    this._pullToolCenterFromLinkedToolGroups();
-  };
-
-  /**
-   * Pulls the current tool center from the first reachable linked toolGroup
-   * (see `configuration.syncWithToolGroupIds`) and applies it to this
-   * instance, instead of passively waiting for the next
-   * `CROSSHAIR_TOOL_CENTER_CHANGED` broadcast.
-   *
-   * This matters because broadcasts fired *before* this toolGroup's own
-   * viewport(s) have been added are silently dropped by
-   * `_applyExternalToolCenter` (it has no viewport to apply the update to
-   * yet) — e.g. the linked (MPR) toolGroup may compute and broadcast its
-   * first real tool center before this `standalone` toolGroup's viewport is
-   * actually registered (viewport/toolGroup wiring is async and the order
-   * between toolGroups isn't guaranteed). Re-pulling here whenever this
-   * toolGroup gains a viewport (see `_computeToolCenter`) acts as a
-   * "catch-up" so the center handle doesn't end up stuck at the default
-   * `[0, 0, 0]` (i.e. off-screen) tool center forever.
-   *
-   * @returns `true` if a linked toolGroup's tool center was found and
-   * successfully applied (or already matched), `false` otherwise (e.g. no
-   * `syncWithToolGroupIds` configured, no linked toolGroup/instance found
-   * yet, or FrameOfReferenceUID mismatch).
-   */
-  _pullToolCenterFromLinkedToolGroups = (): boolean => {
-    const syncWithToolGroupIds: string[] =
-      this.configuration.syncWithToolGroupIds;
-    if (!syncWithToolGroupIds?.length) {
-      this._debugLog(
-        '_pullToolCenterFromLinkedToolGroups:skip:no-linked-groups'
-      );
-      return false;
-    }
-
-    for (const linkedToolGroupId of syncWithToolGroupIds) {
-      const linkedToolGroup = getToolGroup(linkedToolGroupId);
-      const linkedInstance = linkedToolGroup?.getToolInstance?.(
-        this.getToolName()
-      ) as CrosshairsTool | undefined;
-
-      if (!linkedInstance) {
-        continue;
-      }
-
-      const linkedFrameOfReferenceUID =
-        linkedInstance._getOwnFrameOfReferenceUID() ||
-        linkedInstance._lastKnownFrameOfReferenceUID ||
-        undefined;
-      const ownFrameOfReferenceUID = this._getOwnFrameOfReferenceUID();
-
-      this._debugLog(
-        '_pullToolCenterFromLinkedToolGroups:checking-linked-group',
-        {
-          linkedToolGroupId,
-          ownFrameOfReferenceUID,
-          linkedFrameOfReferenceUID,
-          linkedToolCenter: this._formatPoint3(linkedInstance.toolCenter),
-          linkedLastValidToolCenter: this._formatPoint3(
-            linkedInstance._lastValidToolCenter
-          ),
-        }
-      );
-
-      if (linkedInstance.toolCenter) {
-        if (
-          this._isFinitePoint3(linkedInstance.toolCenter) &&
-          !this._isNearZeroPoint3(linkedInstance.toolCenter)
-        ) {
-          const applied = this._applyExternalToolCenter(
-            linkedInstance.toolCenter,
-            linkedFrameOfReferenceUID
-          );
-          if (applied) {
-            this._debugLog(
-              '_pullToolCenterFromLinkedToolGroups:applied-linked-toolCenter',
-              {
-                linkedToolGroupId,
-                resultingToolCenter: this._formatPoint3(this.toolCenter),
-              }
-            );
-            return true;
-          }
-
-          if (!ownFrameOfReferenceUID) {
-            this._commitToolCenter(linkedInstance.toolCenter);
-            this._debugLog(
-              '_pullToolCenterFromLinkedToolGroups:bootstrapped-with-linked-toolCenter-no-own-for',
-              {
-                linkedToolGroupId,
-                resultingToolCenter: this._formatPoint3(this.toolCenter),
-              }
-            );
-            return true;
-          }
-        }
-      }
-
-      if (linkedInstance._lastValidToolCenter) {
-        if (
-          this._isFinitePoint3(linkedInstance._lastValidToolCenter) &&
-          !this._isNearZeroPoint3(linkedInstance._lastValidToolCenter)
-        ) {
-          const applied = this._applyExternalToolCenter(
-            linkedInstance._lastValidToolCenter,
-            linkedFrameOfReferenceUID
-          );
-          if (applied) {
-            this._debugLog(
-              '_pullToolCenterFromLinkedToolGroups:applied-linked-lastValidToolCenter',
-              {
-                linkedToolGroupId,
-                resultingToolCenter: this._formatPoint3(this.toolCenter),
-              }
-            );
-            return true;
-          }
-
-          if (!ownFrameOfReferenceUID) {
-            this._commitToolCenter(linkedInstance._lastValidToolCenter);
-            this._debugLog(
-              '_pullToolCenterFromLinkedToolGroups:bootstrapped-with-linked-lastValidToolCenter-no-own-for',
-              {
-                linkedToolGroupId,
-                resultingToolCenter: this._formatPoint3(this.toolCenter),
-              }
-            );
-            return true;
-          }
-        }
-      }
-    }
-
-    this._debugLog('_pullToolCenterFromLinkedToolGroups:miss');
-
-    return false;
-  };
-
-  /**
-   * Initializes this `standalone` instance's tool center from its own
-   * viewport's current camera focal point (rather than e.g. projecting the
-   * canvas center through `canvasToWorld`, which for a free/perspective 3D
-   * camera doesn't necessarily correspond to anything meaningful) — the
-   * focal point is well-defined for every viewport type (Stack, Volume,
-   * Volume3D) and represents "the point the camera is currently looking
-   * at", which is a reasonable default center when there's nothing to sync
-   * with (yet).
-   */
-  _initializeStandaloneToolCenterFromOwnViewport = (
+  _initializeToolCenterFromOwnViewport = (
     viewportsInfo: { viewportId: string; renderingEngineId: string }[]
   ): void => {
     for (const { viewportId, renderingEngineId } of viewportsInfo) {
@@ -934,296 +590,60 @@ class CrosshairsTool extends AnnotationTool {
         continue;
       }
 
-      this._commitToolCenter(focalPoint, {
-        markStandaloneInitialized: true,
-      });
-      return;
-    }
-  };
-
-  /**
-   * When a `standalone` instance can't yet sync with any of its
-   * `syncWithToolGroupIds` (e.g. the linked MPR toolGroup exists but hasn't
-   * computed its own tool center yet, because its viewports are still
-   * loading), schedule a few short-lived retries in the background instead
-   * of requiring some unrelated interaction (e.g. rotating the 3D view, or
-   * dragging in another viewport) to "kick" a re-sync.
-   */
-  _scheduleStandaloneSyncRetry = (): void => {
-    const MAX_ATTEMPTS = 10;
-    const RETRY_DELAY_MS = 300;
-
-    if (
-      this._standaloneSyncRetryHandle ||
-      this._standaloneSyncRetryAttempts >= MAX_ATTEMPTS
-    ) {
-      return;
-    }
-
-    this._standaloneSyncRetryHandle = setTimeout(() => {
-      this._standaloneSyncRetryHandle = null;
-      this._standaloneSyncRetryAttempts += 1;
-
-      const pulled = this._pullToolCenterFromLinkedToolGroups();
-
-      if (pulled) {
-        this._standaloneSyncRetryAttempts = 0;
-        triggerAnnotationRenderForViewportIds(
-          this._getViewportsInfo().map(({ viewportId }) => viewportId)
-        );
-      } else {
-        this._scheduleStandaloneSyncRetry();
+      const forUID = enabledElement.FrameOfReferenceUID;
+      if (forUID) {
+        const manager = getWorldPointManager();
+        manager.initializePoint(forUID, focalPoint);
       }
-    }, RETRY_DELAY_MS);
-  };
-
-  _clearStandaloneSyncRetry = (): void => {
-    if (this._standaloneSyncRetryHandle) {
-      clearTimeout(this._standaloneSyncRetryHandle);
-      this._standaloneSyncRetryHandle = null;
-    }
-    this._standaloneSyncRetryAttempts = 0;
-  };
-
-  /**
-   * Schedules a couple of extra `triggerAnnotationRenderForViewportIds`
-   * calls a few animation frames out, as cheap insurance against the
-   * initial (synchronous) render request silently finding no enabled
-   * element yet for a just-added viewport. See call site for details.
-   */
-  _scheduleStandaloneRenderRetries = (viewportIds: string[]): void => {
-    // Spread retries out over a few seconds (not just a couple of animation
-    // frames): the actual blocker is often the target image still loading
-    // over the network, which can easily take longer than ~50ms.
-    const RETRY_DELAYS_MS = [50, 150, 300, 600, 1000, 2000, 3000];
-
-    RETRY_DELAYS_MS.forEach((delay) => {
-      const handle = setTimeout(() => {
-        this._standaloneRenderRetryHandles =
-          this._standaloneRenderRetryHandles.filter((h) => h !== handle);
-        triggerAnnotationRenderForViewportIds(viewportIds);
-      }, delay);
-      this._standaloneRenderRetryHandles.push(handle);
-    });
-  };
-
-  _cancelStandaloneRenderRetries = (): void => {
-    this._standaloneRenderRetryHandles.forEach((handle) =>
-      clearTimeout(handle)
-    );
-    this._standaloneRenderRetryHandles = [];
-  };
-
-  _unbindCrossToolGroupSyncListener = (): void => {
-    if (this._onExternalToolCenterChanged) {
-      eventTarget.removeEventListener(
-        Events.CROSSHAIR_TOOL_CENTER_CHANGED,
-        this._onExternalToolCenterChanged
-      );
-      this._onExternalToolCenterChanged = null;
+      this._commitToolCenter(focalPoint);
+      return;
     }
   };
 
   /**
-   * Applies a tool center broadcast by another (linked) CrosshairsTool
-   * instance to this instance's own viewports. No-ops if this toolGroup's
-   * viewports don't share the same FrameOfReferenceUID as the sender (e.g.
-   * a different study is currently loaded into this toolGroup's viewport),
-   * so having multiple, unrelated studies open at once is harmless: a
-   * viewport simply won't react to tool-center updates from a study it
-   * isn't displaying.
-   *
-   * @returns `true` if this instance's tool center is now in sync with
-   * `toolCenter` (whether it just got applied, or already matched), `false`
-   * if the update could not be applied/verified (e.g. no viewport yet, or
-   * FrameOfReferenceUID mismatch/unknown).
+   * Schedules a debounced _computeToolCenter call. When multiple viewports
+   * are added rapidly (e.g. MPR triad: axial+sagittal+coronal), this
+   * coalesces them into a single recompute after the debounce delay,
+   * allowing cameras to settle before computing the intersection.
    */
-  _applyExternalToolCenter = (
-    toolCenter: Types.Point3,
-    senderFrameOfReferenceUID?: string
-  ): boolean => {
-    if (!this._isFinitePoint3(toolCenter)) {
-      this._debugLog('_applyExternalToolCenter:skip:non-finite', {
-        toolCenter: this._formatPoint3(toolCenter),
-      });
-      return false;
+  _scheduleDebouncedRecompute = (): void => {
+    if (this._debouncedRecomputeHandle) {
+      clearTimeout(this._debouncedRecomputeHandle);
     }
 
-    if (this._isNearZeroPoint3(toolCenter)) {
-      this._debugLog('_applyExternalToolCenter:skip:near-zero', {
-        toolCenter: this._formatPoint3(toolCenter),
-      });
-      return false;
+    this._debouncedRecomputeHandle = setTimeout(() => {
+      this._debouncedRecomputeHandle = null;
+      this._computeToolCenter(this._getViewportsInfo());
+    }, this._debounceDelayMs);
+  };
+
+  _cancelDebouncedRecompute = (): void => {
+    if (this._debouncedRecomputeHandle) {
+      clearTimeout(this._debouncedRecomputeHandle);
+      this._debouncedRecomputeHandle = null;
     }
-
-    this._lastValidToolCenter = [...toolCenter] as Types.Point3;
-
-    const viewportsInfo = this._getViewportsInfo();
-    if (!viewportsInfo.length) {
-      this._debugLog('_applyExternalToolCenter:skip:no-viewports');
-      return false;
-    }
-
-    if (csUtils.isEqual(this.toolCenter, toolCenter, 1e-3)) {
-      this._standaloneToolCenterInitialized = true;
-      this._debugLog('_applyExternalToolCenter:already-in-sync', {
-        toolCenter: this._formatPoint3(toolCenter),
-      });
-      return true;
-    }
-
-    const ownFrameOfReferenceUID = this._getOwnFrameOfReferenceUID();
-
-    // If both sides are known and they differ, skip: this world point isn't
-    // meaningful for our own viewports' physical space. If one side is
-    // temporarily unknown (e.g. linked toolGroup currently has no viewport
-    // attached during layout switch), still allow the sync using the last
-    // meaningful center.
-    if (
-      ownFrameOfReferenceUID &&
-      senderFrameOfReferenceUID &&
-      ownFrameOfReferenceUID !== senderFrameOfReferenceUID
-    ) {
-      this._debugLog('_applyExternalToolCenter:skip:for-mismatch', {
-        ownFrameOfReferenceUID,
-        senderFrameOfReferenceUID,
-        toolCenter: this._formatPoint3(toolCenter),
-      });
-      return false;
-    }
-
-    if (this.configuration.standalone) {
-      // Only move the *point* in world space; the viewport's own camera
-      // (pan/zoom/rotation) must stay exactly as the user left it — the
-      // handle should travel across a static image, not the other way
-      // around. `this.toolCenter` (and therefore the rendered handle
-      // position) updates immediately below; the (potentially expensive —
-      // it can trigger a new image load) StackViewport auto-scroll is
-      // coalesced to at most once per animation frame (see
-      // `_scheduleStandaloneStackSlicesSync`), since an external tool
-      // center can otherwise arrive many times per second while the user
-      // is continuously dragging/scrolling in a *linked* toolGroup —
-      // without this, each of those would eagerly trigger a slice change
-      // (and image load) here, which can back up the main thread and make
-      // the crosshair position feel like it "flies away"/lags behind.
-      this._commitToolCenter(toolCenter, {
-        markStandaloneInitialized: true,
-      });
-      this._scheduleStandaloneStackSlicesSync(viewportsInfo, toolCenter);
-    } else {
-      this.setToolCenter(toolCenter, /* suppressEvents = */ true);
-    }
-
-    this._standaloneToolCenterInitialized = true;
-
-    // Deliberately NOT re-broadcasting this received value any further:
-    // `syncWithToolGroupIds` is expected to form a fully-connected mesh
-    // (every toolGroup that needs to stay in sync lists every other one
-    // directly — see toolSetup.ts), so whichever toolGroup performed the
-    // actual local action (drag/scroll) already broadcasts it directly to
-    // every other linked toolGroup on its own (see `_dragCallback`'s
-    // standalone branch and `_handleStandaloneStackNewImage`). Re-emitting
-    // here too would just create redundant N×(N-1) relay hops on top of
-    // those direct paths for no benefit, and was the source of a slow
-    // feedback drift when 3+ toolGroups were linked together.
-    triggerAnnotationRenderForViewportIds(
-      viewportsInfo.map(({ viewportId }) => viewportId)
-    );
-
-    this._debugLog('_applyExternalToolCenter:applied', {
-      ownFrameOfReferenceUID,
-      senderFrameOfReferenceUID,
-      toolCenter: this._formatPoint3(this.toolCenter),
-      standalone: !!this.configuration.standalone,
-    });
-
-    return true;
   };
 
   /**
-   * Schedules `_syncStandaloneStackSlices` to run on the next animation
-   * frame, coalescing any additional calls that happen before then into a
-   * single one using the *latest* requested world point. Used for
-   * externally-triggered syncs (see `_applyExternalToolCenter`), which can
-   * arrive much faster than once per frame while another linked toolGroup
-   * is being continuously dragged/scrolled.
+   * Auto-scrolls any StackViewport(s) to the image index closest to
+   * `worldPoint`, only if it differs from the currently displayed one.
+   * Volume/Volume3D viewports are left untouched (no per-slice concept).
    */
-  _scheduleStandaloneStackSlicesSync = (
+  _syncStackSlices = (
     viewportsInfo: { viewportId: string; renderingEngineId: string }[],
     worldPoint: Types.Point3,
     excludeKey?: string
   ): void => {
-    this._pendingStandaloneStackSlicesSync = {
-      viewportsInfo,
-      worldPoint,
-      excludeKey,
-    };
-
-    if (this._standaloneStackSlicesSyncRafHandle != null) {
-      return;
-    }
-
-    this._standaloneStackSlicesSyncRafHandle = requestAnimationFrame(() => {
-      this._standaloneStackSlicesSyncRafHandle = null;
-
-      const pending = this._pendingStandaloneStackSlicesSync;
-      this._pendingStandaloneStackSlicesSync = null;
-
-      if (pending) {
-        this._syncStandaloneStackSlices(
-          pending.viewportsInfo,
-          pending.worldPoint,
-          pending.excludeKey
-        );
-      }
-    });
-  };
-
-  _cancelStandaloneStackSlicesSync = (): void => {
-    if (this._standaloneStackSlicesSyncRafHandle != null) {
-      cancelAnimationFrame(this._standaloneStackSlicesSyncRafHandle);
-      this._standaloneStackSlicesSyncRafHandle = null;
-    }
-    this._pendingStandaloneStackSlicesSync = null;
-  };
-
-  /**
-   * Auto-scrolls any StackViewport(s) among `viewportsInfo` to the image
-   * index closest to `worldPoint`, so the crosshair position is visible on
-   * whatever image is currently displayed (mirrors
-   * `ReferenceCursors.updateViewportImage`'s StackViewport handling). Only
-   * scrolls if the closest index differs from the currently displayed one.
-   * VolumeViewport/VolumeViewport3D viewports (e.g. a 3D volume render) are
-   * left untouched — there is no per-slice concept for them, and their
-   * camera must not be moved as a side effect of this sync.
-   */
-  _syncStandaloneStackSlices = (
-    viewportsInfo: { viewportId: string; renderingEngineId: string }[],
-    worldPoint: Types.Point3,
-    excludeKey?: string
-  ): void => {
-    // `viewport.setImageIdIndex()` below fires its own STACK_NEW_IMAGE event.
-    // Since this viewport is a member of *this same* toolGroup, that event
-    // would normally be picked back up by our own
-    // `_handleStandaloneStackNewImage`, which would misinterpret our own
-    // programmatic slice change as a fresh user scroll and re-derive (and
-    // re-broadcast) yet another tool center shift on top of the one that's
-    // already being applied - a feedback loop that snowballs the tool
-    // center away from the correct position. Guard against that (checked
-    // at the top of `_handleStandaloneStackNewImage`).
+    // setImageIdIndex() below fires STACK_NEW_IMAGE, which our own
+    // _handleStackNewImage would misread as a user scroll and re-broadcast a
+    // tool center shift (feedback loop). Guard against that.
     const previousIgnoreFiredEvents = this._ignoreFiredEvents;
     this._ignoreFiredEvents = true;
     try {
       viewportsInfo.forEach(({ viewportId, renderingEngineId }) => {
         const key = this._toViewportKey(renderingEngineId, viewportId);
-        // Never auto-scroll the viewport that's actively being dragged (or
-        // otherwise excluded): it must stay exactly on the slice the user
-        // is currently looking at. In principle its own closest-slice index
-        // shouldn't have changed (an in-plane drag shouldn't move it), but
-        // any tiny numerical drift in `worldPoint` could otherwise flip it
-        // to a neighboring slice mid-drag, which would suddenly shift that
-        // viewport's own camera under the user's cursor and make the drag
-        // feel like it's accelerating/fighting itself.
+        // Never auto-scroll the viewport being dragged (or otherwise
+        // excluded): it must stay on the slice the user is looking at.
         if (excludeKey && key === excludeKey) {
           return;
         }
@@ -1254,18 +674,19 @@ class CrosshairsTool extends AnnotationTool {
           return;
         }
 
-        // `setImageIdIndex()` loads the target image and only fires
-        // STACK_NEW_IMAGE once that resolves — *asynchronously*, on a
-        // microtask, well after this synchronous `_ignoreFiredEvents`
-        // guard has already been reset back by the `finally` block below.
-        // So that flag alone can't prevent `_handleStandaloneStackNewImage`
-        // from misreading this *programmatic* change as a fresh user
-        // scroll once it actually fires. Record which index we asked for
-        // instead, so it can recognize + ignore exactly that transition
-        // (and only that one) whenever it does fire.
-        if (this._standaloneStackImageListeners.has(key)) {
-          this._standalonePendingProgrammaticIndex.set(key, closestIndex);
+        // setImageIdIndex() fires STACK_NEW_IMAGE asynchronously, after the
+        // _ignoreFiredEvents guard is reset. Record the requested index so
+        // _handleStackNewImage can recognize and ignore exactly that transition.
+        if (this._stackImageListeners.has(key)) {
+          this._pendingProgrammaticSliceIndex.set(key, closestIndex);
         }
+
+        this._debugLog('_syncStackSlices:setImageIdIndex', {
+          viewportId,
+          from: viewport.getCurrentImageIdIndex(),
+          to: closestIndex,
+          worldPoint: this._formatPoint3(worldPoint),
+        });
 
         viewport.setImageIdIndex(closestIndex);
         viewport.render();
@@ -1294,39 +715,29 @@ class CrosshairsTool extends AnnotationTool {
         const camera = getViewportICamera(viewport);
         const { focalPoint, position, viewPlaneNormal } = camera;
 
-        // Calculate the delta between the current camera focal point and the new tool center
         const delta = [
           toolCenter[0] - focalPoint[0],
           toolCenter[1] - focalPoint[1],
           toolCenter[2] - focalPoint[2],
         ];
 
-        // In `standalone` mode this viewport isn't an orthogonal MPR reformat
-        // plane sharing a mutual intersection point with the other viewports
-        // (e.g. a free-camera 3D volume render, or an otherwise unrelated
-        // viewport that only wants to visually track the crosshair position).
-        // There is no meaningful "slice" for it to scroll to, so instead we
-        // apply the full delta as a rigid pan, keeping its current viewing
-        // angle/zoom and simply re-centering it on the new tool center.
-        // Otherwise (regular MPR reformat viewport), project the delta onto
-        // the view plane normal: this isolates the component of the movement
-        // that corresponds to the "scroll" (slice change).
-        const scrollDelta = this.configuration.standalone
-          ? delta
-          : (() => {
-              const scroll =
-                delta[0] * viewPlaneNormal[0] +
-                delta[1] * viewPlaneNormal[1] +
-                delta[2] * viewPlaneNormal[2];
+        // Project the delta onto the viewport's own view plane normal so we
+        // only "scroll" the reformat plane to the slice containing the tool
+        // center (as MPR does), never panning it in-plane. StackViewports snap
+        // to the closest slice separately via `_syncStackSlices`.
+        const scrollDelta = (() => {
+          const scroll =
+            delta[0] * viewPlaneNormal[0] +
+            delta[1] * viewPlaneNormal[1] +
+            delta[2] * viewPlaneNormal[2];
 
-              return [
-                scroll * viewPlaneNormal[0],
-                scroll * viewPlaneNormal[1],
-                scroll * viewPlaneNormal[2],
-              ];
-            })();
+          return [
+            scroll * viewPlaneNormal[0],
+            scroll * viewPlaneNormal[1],
+            scroll * viewPlaneNormal[2],
+          ];
+        })();
 
-        // Apply this "scroll" to the position and focal point of the camera.
         const newFocalPoint: Types.Point3 = [
           focalPoint[0] + scrollDelta[0],
           focalPoint[1] + scrollDelta[1],
@@ -1339,8 +750,6 @@ class CrosshairsTool extends AnnotationTool {
         ];
 
         if (csUtils.isGenericViewport(viewport)) {
-          // Native PLANAR_NEXT has no setCamera; the move is purely along the view
-          // plane normal (a scroll), so navigate by view reference (snaps to slice).
           jumpToFocalPoint(viewport, newFocalPoint);
         } else {
           viewport.setCamera({
@@ -1358,10 +767,13 @@ class CrosshairsTool extends AnnotationTool {
     this._commitToolCenter(toolCenter);
 
     if (!suppressEvents) {
+      const forUID = this._getOwnFrameOfReferenceUID();
+      const manager = getWorldPointManager();
+      const currentPoint = forUID ? manager.getPoint(forUID) : null;
       triggerEvent(eventTarget, Events.CROSSHAIR_TOOL_CENTER_CHANGED, {
         toolGroupId: this.toolGroupId,
-        toolCenter: this.toolCenter,
-        FrameOfReferenceUID: this._getOwnFrameOfReferenceUID(),
+        toolCenter: currentPoint ?? this.toolCenter,
+        FrameOfReferenceUID: forUID,
       });
     }
   }
@@ -1377,10 +789,17 @@ class CrosshairsTool extends AnnotationTool {
   addNewAnnotation = (
     evt: EventTypes.InteractionEventType
   ): CrosshairsAnnotation => {
-    this._suppressAbsoluteRecomputeUntil = 0;
-
     const eventDetail = evt.detail;
     const { element } = eventDetail;
+
+    const enabledElementForModality = getEnabledElement(element);
+    if (enabledElementForModality?.viewport) {
+      const modality = this._getViewportModality(enabledElementForModality.viewport);
+      if (modality && !getWorldPointManager().isModalitySupported(modality)) {
+        evt.preventDefault();
+        return null;
+      }
+    }
 
     const { currentPoints } = eventDetail;
     const jumpWorld = currentPoints.world;
@@ -1491,11 +910,9 @@ class CrosshairsTool extends AnnotationTool {
     const { element } = eventDetail;
     annotation.highlighted = true;
 
-    // NOTE: handle index or coordinates are not used when dragging.
-    // This because the handle points are actually generated in the renderTool and they are a derivative
-    // from the camera variables of the viewports and of the slab thickness variable.
-    // Remember that the translation and rotation operations operate on the camera
-    // variables and not really on the handles. Similar for the slab thickness.
+    // NOTE: handle index/coordinates aren't used when dragging — translation,
+    // rotation and slab thickness operate on the camera variables, not handles
+    // (handle points are derived in renderTool from the cameras).
     this._activateModify(element);
 
     hideElementCursor(element);
@@ -1520,6 +937,14 @@ class CrosshairsTool extends AnnotationTool {
     canvasCoords: Types.Point2,
     proximity: number
   ): boolean => {
+    const enabledElement = getEnabledElement(element);
+    if (enabledElement?.viewport) {
+      const modality = this._getViewportModality(enabledElement.viewport);
+      if (modality && !getWorldPointManager().isModalitySupported(modality)) {
+        return false;
+      }
+    }
+
     if (this._pointNearTool(element, annotation, canvasCoords, 6)) {
       return true;
     }
@@ -1583,39 +1008,15 @@ class CrosshairsTool extends AnnotationTool {
       ];
     }
 
-    // `standalone` toolGroups (e.g. a single free-camera 3D volume render,
-    // or a 2D stack viewer) don't have a meaningful plane-intersection tool
-    // center to recompute the way MPR does — camera changes there
-    // (rotate/zoom/pan) only change how that viewport *looks* at the
-    // (unchanged) tool center, so nothing to do beyond re-rendering (the
-    // center handle's canvas position is recalculated from `this.toolCenter`
-    // using the viewport's new camera on every render). Note: an actual
-    // slice/scroll change on a StackViewport is handled separately, via a
-    // dedicated STACK_NEW_IMAGE listener (`_syncStandaloneStackImageListeners`
-    // / `_handleStandaloneStackNewImage`) rather than here — scrolling
-    // within a stack uses `resetCameraNoEvent()` internally and does *not*
-    // reliably fire CAMERA_MODIFIED.
-    if (!this.configuration.standalone) {
-      const now = Date.now();
-      if (
-        now < this._suppressAbsoluteRecomputeUntil &&
-        !state.isInteractingWithTool &&
-        !this.editData
-      ) {
-        this._debugLog(
-          'onCameraModified:skip-absolute-recompute-bootstrap-window',
-          {
-            now,
-            suppressUntil: this._suppressAbsoluteRecomputeUntil,
-            toolCenter: this._formatPoint3(this.toolCenter),
-          }
-        );
-      } else {
-        this._recomputeToolCenterFromAbsoluteCameras({
-          emitEvent: true,
-          updateViewportCameras: false,
-        });
-      }
+    // Only MPR reformat VolumeViewports update the shared point from a camera
+    // delta. StackViewport slice changes are handled via STACK_NEW_IMAGE
+    // (`_handleStackNewImage`), and VolumeViewport3D free-orbit moves must
+    // never alter the point (they only re-project it on the next render).
+    if (
+      !(viewport instanceof StackViewport) &&
+      !(viewport instanceof VolumeViewport3D)
+    ) {
+      this._updateToolCenterFromCameraDelta(viewport, evt);
     }
 
     // AutoPan modification
@@ -1645,21 +1046,17 @@ class CrosshairsTool extends AnnotationTool {
   };
 
   /**
-   * Keeps the `_standaloneStackImageListeners` map (a raw STACK_NEW_IMAGE
-   * listener per own StackViewport, see `_handleStandaloneStackNewImage`)
-   * in sync with this toolGroup's current viewport membership. Safe/cheap
-   * to call repeatedly (e.g. on every `_computeToolCenter`) — already-bound
-   * viewports are left untouched, and listeners for viewports no longer in
-   * this toolGroup are torn down.
+   * Keeps `_stackImageListeners` in sync with the toolGroup's current
+   * StackViewport membership. Safe/cheap to call repeatedly.
    */
-  _syncStandaloneStackImageListeners = (viewportsInfo): void => {
+  _syncStackImageListeners = (viewportsInfo): void => {
     const currentKeys = new Set<string>();
 
     viewportsInfo.forEach(({ viewportId, renderingEngineId }) => {
       const key = this._toViewportKey(renderingEngineId, viewportId);
       currentKeys.add(key);
 
-      if (this._standaloneStackImageListeners.has(key)) {
+      if (this._stackImageListeners.has(key)) {
         return;
       }
 
@@ -1678,7 +1075,7 @@ class CrosshairsTool extends AnnotationTool {
 
       const { element } = viewport;
       const listener = ((evt: CustomEvent) => {
-        this._handleStandaloneStackNewImage(
+        this._handleStackNewImage(
           key,
           viewportId,
           viewport,
@@ -1687,89 +1084,68 @@ class CrosshairsTool extends AnnotationTool {
       }) as EventListener;
 
       element.addEventListener(Enums.Events.STACK_NEW_IMAGE, listener);
-      this._standaloneStackImageListeners.set(key, { element, listener });
+      this._stackImageListeners.set(key, { element, listener });
 
-      // Only mark this viewport as "already seen" now if it already has an
-      // image loaded/displayed (`getImageData()` returns something once
-      // the first image has actually rendered). If it doesn't yet (this
-      // viewport was just created and is still loading), leave it unseen:
-      // `_handleStandaloneStackNewImage`'s "first image seen" branch will
-      // mark it — *and* (re-)request a render — once the image actually
-      // finishes loading and its camera settles onto the real position
-      // (STACK_NEW_IMAGE only fires on an actual image change, not merely
-      // because this listener was just bound).
+      // Mark as "seen" only if an image is already loaded; otherwise leave it
+      // unseen so _handleStackNewImage's "first image seen" branch handles it
+      // once the image finishes loading.
       if (viewport.getImageData?.()) {
-        this._standaloneSeenViewports.add(key);
+        this._seenStackViewports.add(key);
       }
     });
 
     for (const [key, { element, listener }] of this
-      ._standaloneStackImageListeners) {
+      ._stackImageListeners) {
       if (!currentKeys.has(key)) {
         element.removeEventListener(Enums.Events.STACK_NEW_IMAGE, listener);
-        this._standaloneStackImageListeners.delete(key);
-        this._standaloneSeenViewports.delete(key);
+        this._stackImageListeners.delete(key);
+        this._seenStackViewports.delete(key);
       }
     }
   };
 
-  _unbindStandaloneStackImageListeners = (): void => {
+  _unbindStackImageListeners = (): void => {
     for (const {
       element,
       listener,
-    } of this._standaloneStackImageListeners.values()) {
+    } of this._stackImageListeners.values()) {
       element.removeEventListener(Enums.Events.STACK_NEW_IMAGE, listener);
     }
-    this._standaloneStackImageListeners.clear();
-    this._standaloneSeenViewports.clear();
-    this._standalonePendingProgrammaticIndex.clear();
+    this._stackImageListeners.clear();
+    this._seenStackViewports.clear();
+    this._pendingProgrammaticSliceIndex.clear();
   };
 
   /**
-   * Reverse sync for `standalone` toolGroups: when the user scrolls through
-   * a StackViewport's series (mouse wheel / StackScroll — i.e. NOT dragging
-   * the center handle), that genuinely changes the physical slice being
-   * displayed, so treat it as a translation of the shared tool center along
-   * that viewport's view plane normal (mirroring the `scroll` projection
-   * MPR itself uses), and broadcast the result outward (e.g. to a linked
-   * MPR toolGroup, which will move its own reformat planes accordingly, and
-   * from there on to any other linked toolGroup such as a 3D volume
-   * render).
-   *
-   * Listens to STACK_NEW_IMAGE directly (rather than CAMERA_MODIFIED):
-   * `StackViewport` scrolling goes through `resetCameraNoEvent()`
-   * internally and does *not* reliably fire CAMERA_MODIFIED, so this is the
-   * only robust signal that the displayed slice actually changed.
+   * Reverse sync for StackViewports: when the user scrolls a stack's series,
+   * shift the shared tool center along that viewport's view plane normal and
+   * broadcast it outward. Listens to STACK_NEW_IMAGE (not CAMERA_MODIFIED)
+   * since stack scrolling doesn't reliably fire CAMERA_MODIFIED.
    */
-  _handleStandaloneStackNewImage = (
+  _handleStackNewImage = (
     key: string,
     viewportId: string,
     viewport,
     eventDetail?: { imageIdIndex?: number }
   ): void => {
-    // Guards against reacting to our *own* programmatic
-    // `setImageIdIndex()` calls in the (rare) case they somehow resolve
-    // synchronously — see the *asynchronous* check right below for the
-    // actual, reliable guard against this.
+    // Guard against our own programmatic setImageIdIndex() calls if they
+    // resolve synchronously (the async case is handled just below).
     if (this._ignoreFiredEvents) {
       return;
     }
 
-    // `setImageIdIndex()` (see `_syncStandaloneStackSlices`) only resolves
-    // — and only then fires STACK_NEW_IMAGE — asynchronously (it loads the
-    // target image first), by which point the synchronous
-    // `_ignoreFiredEvents` guard above has long since been reset. Recognize
-    // (and ignore) exactly the transition we ourselves asked for instead,
-    // so it isn't misread as a fresh user scroll and re-broadcast on top of
-    // the shift that's already being applied.
-    const expectedIndex = this._standalonePendingProgrammaticIndex.get(key);
+    // The programmatic setImageIdIndex() (see _syncStackSlices) fires
+    // STACK_NEW_IMAGE asynchronously, after _ignoreFiredEvents was reset.
+    // Recognize and ignore exactly the transition we requested.
+    const expectedIndex = this._pendingProgrammaticSliceIndex.get(key);
     if (expectedIndex !== undefined) {
-      this._standalonePendingProgrammaticIndex.delete(key);
+      this._pendingProgrammaticSliceIndex.delete(key);
       if (eventDetail?.imageIdIndex === expectedIndex) {
+        // Our own programmatic slice snap; must not overwrite the manager point.
         return;
       }
-      // Otherwise: the user scrolled again before our programmatic change
-      // finished loading — fall through and treat this image as genuine.
+      // Otherwise the user scrolled again before it finished loading — treat
+      // this image as genuine.
     }
 
     const camera = getViewportICamera(viewport);
@@ -1778,18 +1154,19 @@ class CrosshairsTool extends AnnotationTool {
       return;
     }
 
-    // First image ever seen for this viewport (just bound, or was still
-    // loading when we bound to it) — nothing to compare against yet. This
-    // is also, in practice, the moment this viewport's camera — and its
-    // FrameOfReferenceUID, which may not have been available yet when
-    // `initializeViewport` first ran for it right after being added to the
-    // toolGroup — settle onto their real (loaded) values for the first
-    // time. Re-run `initializeViewport` now to recreate the annotation
-    // with a correct/fresh FrameOfReferenceUID rather than possibly leaving
-    // it stuck under whatever (possibly empty/wrong) one was captured
-    // before the image had loaded, then request a render using that.
-    const isFirstImageSeen = !this._standaloneSeenViewports.has(key);
-    this._standaloneSeenViewports.add(key);
+    this._debugLog('_handleStackNewImage:user-scroll', {
+      viewportId,
+      imageIdIndex: eventDetail?.imageIdIndex,
+      newFocalPoint: this._formatPoint3(newFocalPoint),
+      toolCenter: this._formatPoint3(this.toolCenter),
+    });
+
+    // First image ever seen for this viewport — nothing to compare against
+    // yet, and its camera/FrameOfReferenceUID have just settled to real
+    // values. Re-run initializeViewport to recreate the annotation with a
+    // fresh FrameOfReferenceUID, then request a render.
+    const isFirstImageSeen = !this._seenStackViewports.has(key);
+    this._seenStackViewports.add(key);
     if (isFirstImageSeen) {
       const renderingEngineId = this._getViewportsInfo().find(
         (info) => info.viewportId === viewportId
@@ -1798,30 +1175,27 @@ class CrosshairsTool extends AnnotationTool {
         this.initializeViewport({ viewportId, renderingEngineId });
       }
 
+      const forUID = this._getOwnFrameOfReferenceUID();
+      const manager = getWorldPointManager();
       if (
-        !this._standaloneToolCenterInitialized ||
+        (forUID && !manager.isInitialized(forUID)) ||
         !this._isFinitePoint3(this.toolCenter) ||
         this._isNearZeroPoint3(this.toolCenter)
       ) {
-        this._commitToolCenter(newFocalPoint, {
-          markStandaloneInitialized: true,
-        });
+        if (forUID) {
+          manager.initializePoint(forUID, newFocalPoint);
+        }
+        this._commitToolCenter(newFocalPoint);
       }
 
       triggerAnnotationRenderForViewportIds([viewportId]);
       return;
     }
 
-    // Rather than diffing against a snapshot of "where this viewport's
-    // camera was last time" (which can go stale/racy — e.g. if a drag on
-    // the center handle, or a sync from another linked toolGroup, changed
-    // `this.toolCenter` while *this* scroll's image was still asynchronously
-    // loading, applying a delta on top of an outdated baseline would
-    // effectively undo that other change), self-correct instead: measure
-    // how far the shared tool center *currently* sits from this viewport's
-    // (now-updated) slice plane, along its view plane normal, and shift by
-    // exactly that much. This is idempotent and always relative to the
-    // latest state, so it can't clobber anything that happened in between.
+    // Self-correct rather than diffing against a stale camera snapshot:
+    // measure how far the shared tool center currently sits from this
+    // viewport's slice plane (along its normal) and shift by exactly that.
+    // Idempotent and always relative to the latest state.
     const { viewPlaneNormal } = camera;
     const toCenterDelta: Types.Point3 = [
       newFocalPoint[0] - this.toolCenter[0],
@@ -1853,23 +1227,24 @@ class CrosshairsTool extends AnnotationTool {
       this.toolCenter[2] + shift[2],
     ];
 
-    this._commitToolCenter(newToolCenter, {
-      markStandaloneInitialized: true,
-    });
+    const forUID = this._getOwnFrameOfReferenceUID();
+    const manager = getWorldPointManager();
+    const renderingEngineId = this._getViewportsInfo().find(
+      (info) => info.viewportId === viewportId
+    )?.renderingEngineId;
 
-    // Keep any *other* StackViewport(s) in this same toolGroup in step too
-    // (excluding the one that was just scrolled — it's already showing the
-    // right slice).
-    this._syncStandaloneStackSlices(
-      this._getViewportsInfo(),
-      newToolCenter,
-      key
-    );
+    // Update the shared point in the manager (source of truth); it notifies
+    // every other subscriber. We deliberately don't call _syncStackSlices for
+    // this viewport — it's already on the correct slice.
+    this._commitToolCenter(newToolCenter, {
+      senderViewportId: viewportId,
+      senderRenderingEngineId: renderingEngineId,
+    });
 
     triggerEvent(eventTarget, Events.CROSSHAIR_TOOL_CENTER_CHANGED, {
       toolGroupId: this.toolGroupId,
-      toolCenter: this.toolCenter,
-      FrameOfReferenceUID: this._getOwnFrameOfReferenceUID(),
+      toolCenter: forUID ? (manager.getPoint(forUID) ?? newToolCenter) : newToolCenter,
+      FrameOfReferenceUID: forUID,
     });
 
     triggerAnnotationRenderForViewportIds(
@@ -1889,11 +1264,16 @@ class CrosshairsTool extends AnnotationTool {
     const canvasCoords = currentPoints.canvas;
     let imageNeedsUpdate = false;
 
-    // `mouseMove.ts` calls `mouseMoveCallback(evt)` (no second argument) for
-    // tools that currently have no annotation for this element, so this can
-    // be `undefined` (e.g. right after a viewport is enabled/added to the
-    // toolGroup, but before `initializeViewport` has created its annotation
-    // yet).
+    const enabledElement = getEnabledElement(element);
+    if (enabledElement?.viewport) {
+      const modality = this._getViewportModality(enabledElement.viewport);
+      if (modality && !getWorldPointManager().isModalitySupported(modality)) {
+        return imageNeedsUpdate;
+      }
+    }
+
+    // `filteredToolAnnotations` can be undefined when there is no annotation
+    // for this element yet (e.g. before initializeViewport has run).
     if (!filteredToolAnnotations?.length) {
       return imageNeedsUpdate;
     }
@@ -1995,6 +1375,20 @@ class CrosshairsTool extends AnnotationTool {
 
     const annotationUID = viewportAnnotation.annotationUID;
 
+    const viewportsInfo = this._getViewportsInfo();
+
+    const viewportModality = this._getViewportModality(viewport);
+    if (viewportModality) {
+      const manager = getWorldPointManager();
+      if (!manager.isModalitySupported(viewportModality)) {
+        return renderStatus;
+      }
+    }
+
+    // A lone StackViewport (single subscriber for its FOR) has no other
+    // orientation planes to draw reference lines against — but we still fall
+    // through to render the center handle below.
+
     // Get cameras/canvases for each of these.
     // -- Get two world positions for this canvas in this line (e.g. the diagonal)
     // -- Convert these world positions to this canvas.
@@ -2009,16 +1403,15 @@ class CrosshairsTool extends AnnotationTool {
     const data = viewportAnnotation.data;
     const crosshairCenterCanvas = viewport.worldToCanvas(this.toolCenter);
 
-    // `standalone` toolGroups (see configuration doc) don't have mutually
-    // orthogonal reformat planes to draw reference lines/rotation/slab
-    // handles against - only the `centerHandle` circle (rendered further
-    // below) is meaningful for them.
-    const otherViewportAnnotations = this.configuration.standalone
-      ? []
-      : this._filterAnnotationsByUniqueViewportOrientations(
-          enabledElement,
-          annotations
-        );
+    // Reference lines / rotation / slab-thickness handles are only meaningful
+    // between viewports with distinct orientation planes. This filter returns
+    // an empty array for a single-viewport FOR, in which case only the
+    // `centerHandle` circle (rendered further below) is drawn.
+    const otherViewportAnnotations =
+      this._filterAnnotationsByUniqueViewportOrientations(
+        enabledElement,
+        annotations
+      );
 
     const referenceLines = [];
 
@@ -2033,6 +1426,17 @@ class CrosshairsTool extends AnnotationTool {
       const otherViewport = renderingEngine.getViewport(
         data.viewportId
       ) as Types.IVolumeViewport;
+
+      // Reference lines / slab-thickness handles are only meaningful for
+      // volume viewports with orientation planes. Skip StackViewports (which
+      // have no slab API) to avoid calling volume-only methods on them.
+      if (
+        !otherViewport ||
+        otherViewport instanceof StackViewport ||
+        typeof otherViewport.getSlabThickness !== 'function'
+      ) {
+        return;
+      }
 
       const otherCamera = getViewportICamera(otherViewport);
 
@@ -2671,7 +2075,7 @@ class CrosshairsTool extends AnnotationTool {
             line[8],
             {
               color,
-              width: line,
+              width: 1,
               lineDash: [2, 3],
             }
           );
@@ -2783,12 +2187,17 @@ class CrosshairsTool extends AnnotationTool {
   _onNewVolume = (_evt?: Event) => {
     this._syncVolumeListenersWithToolGroup();
 
-    if (!this.configuration.standalone) {
-      const pulled = this._pullToolCenterFromLinkedToolGroups();
-      if (!pulled && this._lastValidToolCenter) {
-        this.setToolCenter(this._lastValidToolCenter, false);
-        return;
-      }
+    const forUID = this._getOwnFrameOfReferenceUID();
+    const manager = getWorldPointManager();
+    const sharedCenter = forUID ? manager.getPoint(forUID) : null;
+    if (sharedCenter) {
+      this.setToolCenter(sharedCenter, true);
+      return;
+    }
+
+    if (this._lastValidToolCenter) {
+      this.setToolCenter(this._lastValidToolCenter, false);
+      return;
     }
 
     this._recomputeToolCenterFromAbsoluteCameras({
@@ -2796,24 +2205,6 @@ class CrosshairsTool extends AnnotationTool {
       updateViewportCameras: false,
     });
   };
-
-  /**
-   * @deprecated No longer manages per-viewport listeners directly.
-   * Listener lifecycle is now handled by _syncVolumeListenersWithToolGroup.
-   * Will be removed in a future version.
-   */
-  _unsubscribeToViewportNewVolumeSet(_viewportsInfo) {
-    this._syncVolumeListenersWithToolGroup();
-  }
-
-  /**
-   * @deprecated No longer manages per-viewport listeners directly.
-   * Listener lifecycle is now handled by _syncVolumeListenersWithToolGroup.
-   * Will be removed in a future version.
-   */
-  _subscribeToViewportNewVolumeSet(_viewports) {
-    this._syncVolumeListenersWithToolGroup();
-  }
 
   _autoPanViewportIfNecessary(
     viewportId: string,
@@ -2823,9 +2214,8 @@ class CrosshairsTool extends AnnotationTool {
     // 2. If it is outside, pan the viewport to fit in the toolCenter
 
     const viewport = renderingEngine.getViewport(viewportId);
-    // Auto-pan is an in-plane world-space focal-point shift (setCamera), which native
-    // PLANAR_NEXT cannot express (setViewReference snaps to slice). Skip on native;
-    // it is a comfort feature, not correctness. TODO(next): port via setViewState anchorWorld.
+    // Auto-pan is an in-plane focal-point shift (setCamera) that native
+    // PLANAR_NEXT can't express; skip on native (comfort feature only).
     if (csUtils.isGenericViewport(viewport)) {
       return;
     }
@@ -3203,9 +2593,8 @@ class CrosshairsTool extends AnnotationTool {
   };
 
   _checkIfViewportsRenderingSameScene = (viewport, otherViewport) => {
-    // Native PLANAR_NEXT has no getAllVolumeIds; two native viewports render the same
-    // scene when they are bound to the same dataset (view-reference dataId), which is
-    // the MPR case (axial/sagittal/coronal of one volume share a dataId).
+    // Native PLANAR_NEXT has no getAllVolumeIds; compare view-reference dataId
+    // instead (MPR planes of one volume share a dataId).
     if (
       csUtils.isGenericViewport(viewport) ||
       csUtils.isGenericViewport(otherViewport)
@@ -3271,12 +2660,23 @@ class CrosshairsTool extends AnnotationTool {
       viewportsAnnotationsToUpdate,
       delta
     );
-    this._recomputeToolCenterFromAbsoluteCameras({
-      emitEvent: true,
-      updateViewportCameras: false,
+
+    const forUID = this._getOwnFrameOfReferenceUID();
+    const manager = getWorldPointManager();
+    if (forUID) {
+      manager.setPoint(forUID, jumpWorld, viewport.id, renderingEngine.id);
+    }
+    this._commitToolCenter(jumpWorld, {
+      senderViewportId: viewport.id,
+      senderRenderingEngineId: renderingEngine.id,
     });
 
-    // Render the source viewport so its crosshair lines update to the new tool center.
+    triggerEvent(eventTarget, Events.CROSSHAIR_TOOL_CENTER_CHANGED, {
+      toolGroupId: this.toolGroupId,
+      toolCenter: forUID ? (manager.getPoint(forUID) ?? jumpWorld) : jumpWorld,
+      FrameOfReferenceUID: forUID,
+    });
+
     viewport.render();
 
     state.isInteractingWithTool = false;
@@ -3285,8 +2685,6 @@ class CrosshairsTool extends AnnotationTool {
   };
 
   _activateModify = (element) => {
-    this._suppressAbsoluteRecomputeUntil = 0;
-
     this._syncVolumeListenersWithToolGroup();
     this._recomputeToolCenterFromAbsoluteCameras({
       emitEvent: false,
@@ -3323,16 +2721,39 @@ class CrosshairsTool extends AnnotationTool {
     const eventDetail = evt.detail;
     const { element } = eventDetail;
 
+    // Capture the operation type BEFORE it is cleared below — we need it to
+    // decide whether a post-interaction camera-plane recompute is allowed.
+    const lastOperation =
+      this.editData?.annotation?.data?.handles?.activeOperation;
+    const wasDragOperation = lastOperation === OPERATION.DRAG;
+
     if (this.editData?.annotation?.data) {
       this.editData.annotation.data.handles.activeOperation = null;
       this.editData.annotation.data.activeViewportIds = [];
     }
 
     this._deactivateModify(element);
-    this._recomputeToolCenterFromAbsoluteCameras({
-      emitEvent: true,
-      updateViewportCameras: false,
-    });
+
+    // Snap any StackViewport(s) to the slice closest to the final tool center
+    // only now that the drag has ended (during the drag the marker moves
+    // smoothly on canvas without switching slices — see `_dragCallback` — to
+    // avoid a slice-change/recompute feedback loop).
+    const forUID = this._getOwnFrameOfReferenceUID();
+    const manager = getWorldPointManager();
+    const point = forUID ? manager.getPoint(forUID) : null;
+    if (point) {
+      this._syncStackSlices(this._getViewportsInfo(), point);
+    }
+
+    // A DRAG only translates cameras (no orientation change), so toolCenter is
+    // already correct — recomputing from camera-plane intersection would make
+    // it snap/drift on release. Only recompute after ROTATE/SLAB.
+    if (!wasDragOperation) {
+      this._recomputeToolCenterFromAbsoluteCameras({
+        emitEvent: true,
+        updateViewportCameras: false,
+      });
+    }
 
     resetElementCursor(element);
 
@@ -3380,85 +2801,108 @@ class CrosshairsTool extends AnnotationTool {
     const canvasCoords = currentPoints.canvas;
 
     if (handles.activeOperation === OPERATION.DRAG) {
-      if (this.configuration.standalone) {
-        // TRANSLATION (standalone toolGroup)
-        // There are no sibling MPR viewports in this toolGroup whose camera
-        // needs to be shifted, and no plane-intersection geometry to
-        // recompute the tool center from. The dragged viewport's own camera
-        // doesn't need to move either (its canvas<->world mapping already
-        // reflects the new tool center consistently, since `delta` was
-        // derived from that same, unchanged camera). Just translate the
-        // tool center directly and broadcast it (e.g. to a linked MPR
-        // toolGroup via `syncWithToolGroupIds`).
-        const newToolCenter: Types.Point3 = [
+      const forUID = this._getOwnFrameOfReferenceUID();
+      const manager = getWorldPointManager();
+
+      // For a StackViewport, snap the point directly to
+      // canvasToWorld(currentCanvas) instead of accumulating an in-plane delta
+      // (which drifts off the slice plane over time). Guarantees 1:1 mouse
+      // tracking on the physical slice plane.
+      const isStackSource = viewport instanceof StackViewport;
+
+      // World-space movement of this drag step, used to scroll the other MPR
+      // reference planes. Raw `delta` for an MPR source; derived from the
+      // snapped point movement for a StackViewport.
+      let actualDelta: Types.Point3 = delta as Types.Point3;
+
+      let newToolCenter: Types.Point3;
+      if (isStackSource) {
+        const currentWorld = viewport.canvasToWorld(
+          currentPoints.canvas
+        ) as Types.Point3;
+
+        newToolCenter = [currentWorld[0], currentWorld[1], currentWorld[2]];
+
+        actualDelta = [
+          newToolCenter[0] - this.toolCenter[0],
+          newToolCenter[1] - this.toolCenter[1],
+          newToolCenter[2] - this.toolCenter[2],
+        ];
+
+        this._debugLog('_dragCallback:DRAG:stack-source', {
+          viewportId: viewport.id,
+          currentWorld: this._formatPoint3(currentWorld),
+          actualDelta: this._formatPoint3(actualDelta),
+          newToolCenter: this._formatPoint3(newToolCenter),
+        });
+      } else {
+        newToolCenter = [
           this.toolCenter[0] + delta[0],
           this.toolCenter[1] + delta[1],
           this.toolCenter[2] + delta[2],
         ];
-        this._commitToolCenter(newToolCenter, {
-          markStandaloneInitialized: true,
-        });
 
-        // If this toolGroup has other (StackViewport) viewports besides the
-        // one being dragged, auto-scroll them to the slice closest to the
-        // new tool center — the one being dragged is explicitly excluded:
-        // it must stay exactly on the slice the user is currently viewing
-        // for the whole duration of the drag.
-        this._syncStandaloneStackSlices(
-          this._getViewportsInfo(),
-          newToolCenter,
-          this._toViewportKey(renderingEngine.id, viewport.id)
-        );
-
-        triggerEvent(eventTarget, Events.CROSSHAIR_TOOL_CENTER_CHANGED, {
-          toolGroupId: this.toolGroupId,
-          toolCenter: this.toolCenter,
-          FrameOfReferenceUID: this._getOwnFrameOfReferenceUID(),
-        });
-      } else {
-        // TRANSLATION
-        // get the annotation of the other viewport which are parallel to the delta shift and are of the same scene
-        const otherViewportAnnotations =
-          this._getAnnotationsForViewportsWithDifferentCameras(
-            enabledElement,
-            annotations
-          );
-
-        const viewportsAnnotationsToUpdate = otherViewportAnnotations.filter(
-          (annotation) => {
-            const { data } = annotation;
-            const otherViewport = renderingEngine.getViewport(data.viewportId);
-            const otherViewportControllable =
-              this._getReferenceLineControllable(otherViewport.id);
-            const otherViewportDraggableRotatable =
-              this._getReferenceLineDraggableRotatable(otherViewport.id);
-
-            return (
-              otherViewportControllable === true &&
-              otherViewportDraggableRotatable === true &&
-              viewportAnnotation.data.activeViewportIds.find(
-                (id) => id === otherViewport.id
-              )
-            );
-          }
-        );
-
-        this._applyDeltaShiftToSelectedViewportCameras(
-          renderingEngine,
-          viewportsAnnotationsToUpdate,
-          delta
-        );
-        this._recomputeToolCenterFromAbsoluteCameras({
-          emitEvent: true,
-          updateViewportCameras: false,
+        this._debugLog('_dragCallback:DRAG:volume-source', {
+          viewportId: viewport.id,
+          delta: this._formatPoint3(delta as Types.Point3),
+          newToolCenter: this._formatPoint3(newToolCenter),
         });
       }
+
+      // Scroll the other MPR reformat planes along their normals so they
+      // follow the drag. StackViewports are NOT slice-switched here (that would
+      // cause a feedback loop); their slice snaps on drag end (_endCallback).
+      const otherViewportAnnotations =
+        this._getAnnotationsForViewportsWithDifferentCameras(
+          enabledElement,
+          annotations
+        );
+
+      const viewportsAnnotationsToUpdate = otherViewportAnnotations.filter(
+        (annotation) => {
+          const { data } = annotation;
+          const otherViewport = renderingEngine.getViewport(data.viewportId);
+          const otherViewportControllable =
+            this._getReferenceLineControllable(otherViewport.id);
+          const otherViewportDraggableRotatable =
+            this._getReferenceLineDraggableRotatable(otherViewport.id);
+
+          return (
+            !(otherViewport instanceof StackViewport) &&
+            otherViewportControllable === true &&
+            otherViewportDraggableRotatable === true &&
+            viewportAnnotation.data.activeViewportIds.find(
+              (id) => id === otherViewport.id
+            )
+          );
+        }
+      );
+
+      // Use the in-plane `actualDelta` (exact world movement in the slice
+      // plane) so MPR reference planes follow the mouse precisely. For MPR
+      // sources `actualDelta === delta`.
+      this._applyDeltaShiftToSelectedViewportCameras(
+        renderingEngine,
+        viewportsAnnotationsToUpdate,
+        actualDelta
+      );
+
+      // Update the shared point in the manager (source of truth). The manager
+      // notifies every *other* subscriber (excluding this sender viewport), so
+      // the cursor never gets snapped back to its original position.
+      this._commitToolCenter(newToolCenter, {
+        senderViewportId: viewport.id,
+        senderRenderingEngineId: renderingEngine.id,
+      });
+
+      triggerEvent(eventTarget, Events.CROSSHAIR_TOOL_CENTER_CHANGED, {
+        toolGroupId: this.toolGroupId,
+        toolCenter: forUID ? (manager.getPoint(forUID) ?? newToolCenter) : newToolCenter,
+        FrameOfReferenceUID: forUID,
+      });
     } else if (handles.activeOperation === OPERATION.ROTATE) {
-      // ROTATION
-      // Native PLANAR_NEXT has no setCamera and no validated free-oblique orientation
-      // write, so crosshairs rotation cannot be applied; skip it on native (the rotate
-      // handles are inert rather than throwing). TODO(next): oblique reformat via a
-      // setViewReference orientation write once cornerstone supports it.
+      // ROTATION — skipped on native PLANAR_NEXT (no setCamera / oblique
+      // orientation write); the rotate handles are inert rather than throwing.
       if (csUtils.isGenericViewport(enabledElement.viewport)) {
         return;
       }
@@ -3571,9 +3015,7 @@ class CrosshairsTool extends AnnotationTool {
         updateViewportCameras: false,
       });
     } else if (handles.activeOperation === OPERATION.SLAB) {
-      // SLAB THICKNESS
-      // Native PLANAR_NEXT has no slab-thickness API (setSlabThickness/
-      // resetSlabThickness); skip the slab operation on native rather than throwing.
+      // SLAB THICKNESS — skipped on native PLANAR_NEXT (no slab-thickness API).
       if (csUtils.isGenericViewport(enabledElement.viewport)) {
         return;
       }
@@ -3768,8 +3210,7 @@ class CrosshairsTool extends AnnotationTool {
   };
 
   setSlabThickness(viewport, slabThickness) {
-    // Native PLANAR_NEXT has no slab API (setBlendMode/setSlabThickness). The SLAB
-    // drag operation is already gated off on native; guard here too for safety.
+    // Native PLANAR_NEXT has no slab API; guard here for safety.
     if (csUtils.isGenericViewport(viewport)) {
       return;
     }
@@ -3817,6 +3258,16 @@ class CrosshairsTool extends AnnotationTool {
     const { data } = annotation;
 
     const viewport = renderingEngine.getViewport(data.viewportId);
+
+    // 3D volume renders have no per-slice scroll concept; their free-orbit
+    // camera must not be shifted, only re-project the point on render.
+    if (
+      csUtils.isGenericViewport(viewport) ||
+      viewport instanceof VolumeViewport3D
+    ) {
+      return;
+    }
+
     const camera = getViewportICamera(viewport);
     const normal = camera.viewPlaneNormal;
 
@@ -3841,8 +3292,7 @@ class CrosshairsTool extends AnnotationTool {
       this._ignoreFiredEvents = true;
       try {
         if (csUtils.isGenericViewport(viewport)) {
-          // Pure along-normal scroll; native has no setCamera, so navigate by view
-          // reference (snaps to nearest slice).
+          // Native has no setCamera; navigate by view reference (snaps to slice).
           jumpToFocalPoint(viewport, newFocalPoint);
         } else {
           viewport.setCamera({
@@ -4015,15 +3465,8 @@ class CrosshairsTool extends AnnotationTool {
   }
 
   /**
-   * Returns the ids of the other (non-current) viewports in the toolGroup
-   * whose reference lines/cameras should be translated together when the
-   * crosshairs tool center is dragged directly (e.g. via the center handle).
-   * This mirrors the filtering used when a single reference line is dragged,
-   * but includes every other controllable+draggable viewport instead of just
-   * the ones whose line is under the cursor.
-   *
-   * @param currentViewportId - The id of the viewport the drag started from.
-   * @returns Array of viewport ids to translate.
+   * Returns the ids of every other controllable+draggable viewport in the
+   * toolGroup, to translate together when dragging the center handle.
    */
   _getAllDraggableOtherViewportIds = (currentViewportId: string): string[] => {
     const viewportsInfo = this._getViewportsInfo();
@@ -4046,11 +3489,8 @@ class CrosshairsTool extends AnnotationTool {
   };
 
   /**
-   * Checks whether the given canvas coordinates are near the crosshairs'
-   * center handle (a small circle rendered at the tool center). If so, it
-   * marks the annotation as ready for a translation (DRAG) operation
-   * affecting every other draggable viewport, so that dragging from the
-   * center moves the whole crosshair instead of a single reference line.
+   * If `canvasCoords` is near the center handle, marks the annotation for a
+   * translation (DRAG) of every other draggable viewport.
    */
   _getCenterHandleNearImagePoint(
     viewport,
@@ -4273,8 +3713,197 @@ class CrosshairsTool extends AnnotationTool {
     return data.handles.activeOperation === OPERATION.DRAG ? true : false;
   }
 
+  _registerViewportWithManager = (
+    renderingEngineId: string,
+    viewportId: string
+  ): void => {
+    const enabledElement = getEnabledElementByIds(viewportId, renderingEngineId);
+    if (!enabledElement) {
+      return;
+    }
+
+    const { FrameOfReferenceUID, viewport } = enabledElement;
+    if (!FrameOfReferenceUID) {
+      console.warn(
+        `[CrosshairsTool] No FrameOfReferenceUID for viewport "${viewportId}". Skipping manager registration.`
+      );
+      return;
+    }
+
+    const manager = getWorldPointManager();
+    const viewportType = viewport instanceof StackViewport ? 'stack' : 'volume';
+    const modality = this._getViewportModality(viewport);
+
+    manager.registerViewport(FrameOfReferenceUID, {
+      viewportId,
+      renderingEngineId,
+      viewportType,
+      modality,
+      onWorldPointChanged: (point: Types.Point3, senderViewportId?: string) => {
+        if (senderViewportId === viewportId) {
+          return;
+        }
+        this._onManagerPointChanged(point, viewportId, renderingEngineId, senderViewportId);
+      },
+    });
+  };
+
+  _unregisterViewportFromManager = (
+    renderingEngineId: string,
+    viewportId: string
+  ): void => {
+    const enabledElement = getEnabledElementByIds(viewportId, renderingEngineId);
+    const forUID = enabledElement?.FrameOfReferenceUID || this._getOwnFrameOfReferenceUID();
+    if (forUID) {
+      const manager = getWorldPointManager();
+      manager.unregisterViewport(forUID, renderingEngineId, viewportId);
+    }
+  };
+
+  _onManagerPointChanged = (
+  point: Types.Point3,
+  targetViewportId: string,
+  targetRenderingEngineId: string,
+  senderViewportId?: string
+): void => {
+  // Ignore updates that originated from this very viewport.
+  if (senderViewportId && senderViewportId === targetViewportId) {
+    return;
+  }
+  
+  this._localToolCenter = [...point] as Types.Point3;
+  if (this._isFinitePoint3(point) && !this._isNearZeroPoint3(point)) {
+    this._lastValidToolCenter = [...point] as Types.Point3;
+  }
+
+  const enabledElement = getEnabledElementByIds(
+    targetViewportId,
+    targetRenderingEngineId
+  );
+  if (!enabledElement) {
+    triggerAnnotationRenderForViewportIds([targetViewportId]);
+    return;
+  }
+  const { viewport } = enabledElement;
+
+  this._debugLog('_onManagerPointChanged', {
+    targetViewportId,
+    senderViewportId,
+    point: this._formatPoint3(point),
+    viewportType: viewport instanceof StackViewport ? 'stack' : 'volume',
+  });
+
+  const isCrosshairDragging =
+    this.editData?.annotation?.data?.handles?.activeOperation ===
+    OPERATION.DRAG;
+
+  if (viewport instanceof StackViewport) {
+    // StackViewports are excluded from direct camera shifts in _dragCallback,
+    // so they must receive updates via the manager even during a drag (enables
+    // live scroll across 2D planes). Feedback loop is guarded by
+    // _pendingProgrammaticSliceIndex.
+    this._syncStackSlices(
+      [{ viewportId: targetViewportId, renderingEngineId: targetRenderingEngineId }],
+      point
+    );
+  } else {
+    // MPR (Volume) viewports are already shifted directly by the drag source
+    // via _applyDeltaShiftToSelectedViewportCameras; applying the manager
+    // update again here would move them at double speed, so ignore it during a
+    // drag.
+    if (isCrosshairDragging) {
+      return;
+    }
+    this._scrollVolumeViewportToPoint(viewport, point);
+  }
+  
+  triggerAnnotationRenderForViewportIds([targetViewportId]);
+};
+
+  /**
+   * Scrolls a non-Stack viewport's camera along its view plane normal so the
+   * reformat plane passes through `worldPoint`, without panning in-plane.
+   * Wrapped in _ignoreFiredEvents so the emitted CAMERA_MODIFIED doesn't loop back.
+   */
+  _scrollVolumeViewportToPoint = (
+    viewport,
+    worldPoint: Types.Point3
+  ): void => {
+    const camera = getViewportICamera(viewport);
+    const { focalPoint, position, viewPlaneNormal } = camera;
+    if (!focalPoint || !position || !viewPlaneNormal) {
+      return;
+    }
+
+    const scroll =
+      (worldPoint[0] - focalPoint[0]) * viewPlaneNormal[0] +
+      (worldPoint[1] - focalPoint[1]) * viewPlaneNormal[1] +
+      (worldPoint[2] - focalPoint[2]) * viewPlaneNormal[2];
+
+    if (Math.abs(scroll) < 1e-3) {
+      return;
+    }
+
+    const newFocalPoint: Types.Point3 = [
+      focalPoint[0] + scroll * viewPlaneNormal[0],
+      focalPoint[1] + scroll * viewPlaneNormal[1],
+      focalPoint[2] + scroll * viewPlaneNormal[2],
+    ];
+    const newPosition: Types.Point3 = [
+      position[0] + scroll * viewPlaneNormal[0],
+      position[1] + scroll * viewPlaneNormal[1],
+      position[2] + scroll * viewPlaneNormal[2],
+    ];
+
+    const previousIgnoreFiredEvents = this._ignoreFiredEvents;
+    this._ignoreFiredEvents = true;
+    try {
+      if (csUtils.isGenericViewport(viewport)) {
+        jumpToFocalPoint(viewport, newFocalPoint);
+      } else {
+        viewport.setCamera({ focalPoint: newFocalPoint, position: newPosition });
+      }
+      viewport.render();
+    } finally {
+      this._ignoreFiredEvents = previousIgnoreFiredEvents;
+    }
+
+    this._debugLog('_scrollVolumeViewportToPoint', {
+      viewportId: viewport.id,
+      scroll: scroll.toFixed(4),
+      newFocalPoint: this._formatPoint3(newFocalPoint),
+    });
+  };
+
+  _registerAllViewportsWithManager = (): void => {
+    const viewportsInfo = this._getViewportsInfo();
+    viewportsInfo.forEach(({ viewportId, renderingEngineId }) => {
+      this._registerViewportWithManager(renderingEngineId, viewportId);
+    });
+  };
+
+  _unregisterAllViewportsFromManager = (): void => {
+    const viewportsInfo = this._getViewportsInfo();
+    viewportsInfo.forEach(({ viewportId, renderingEngineId }) => {
+      this._unregisterViewportFromManager(renderingEngineId, viewportId);
+    });
+  };
+
   _toViewportKey = (renderingEngineId: string, viewportId: string): string => {
     return `${renderingEngineId}::${viewportId}`;
+  };
+
+  _getViewportModality = (viewport: any): string => {
+    try {
+      if (typeof csUtils.getViewportModality === 'function') {
+        return csUtils.getViewportModality(viewport);
+      }
+    } catch {
+    }
+    if (viewport?.modality) {
+      return viewport.modality;
+    }
+    return 'CT';
   };
 
   _isDebugEnabled = (): boolean => {
@@ -4348,79 +3977,28 @@ class CrosshairsTool extends AnnotationTool {
   _commitToolCenter = (
     point: Types.Point3,
     {
-      markStandaloneInitialized = false,
-    }: { markStandaloneInitialized?: boolean } = {}
+      senderViewportId,
+      senderRenderingEngineId,
+    }: {
+      senderViewportId?: string;
+      senderRenderingEngineId?: string;
+    } = {}
   ): void => {
-    this.toolCenter = [...point] as Types.Point3;
+    this._localToolCenter = [...point] as Types.Point3;
+
+    const forUID = this._getOwnFrameOfReferenceUID();
+    if (forUID) {
+      const manager = getWorldPointManager();
+      if (!manager.isInitialized(forUID)) {
+        manager.initializePoint(forUID, point);
+      } else {
+        manager.setPoint(forUID, point, senderViewportId, senderRenderingEngineId);
+      }
+    }
 
     if (this._isFinitePoint3(point) && !this._isNearZeroPoint3(point)) {
       this._lastValidToolCenter = [...point] as Types.Point3;
-      this._storeSharedToolCenter(point);
     }
-
-    if (markStandaloneInitialized) {
-      this._standaloneToolCenterInitialized = true;
-    }
-  };
-
-  _storeSharedToolCenter = (point: Types.Point3): void => {
-    if (!this._isFinitePoint3(point) || this._isNearZeroPoint3(point)) {
-      return;
-    }
-
-    const pointCopy = [...point] as Types.Point3;
-    const frameOfReferenceUID = this._getOwnFrameOfReferenceUID();
-    if (frameOfReferenceUID) {
-      CrosshairsTool._sharedCenterByFrameOfReference.set(
-        frameOfReferenceUID,
-        pointCopy
-      );
-    }
-
-    if (this._lastKnownFrameOfReferenceUID) {
-      CrosshairsTool._sharedCenterByFrameOfReference.set(
-        this._lastKnownFrameOfReferenceUID,
-        pointCopy
-      );
-    }
-
-    CrosshairsTool._sharedLastCenter = pointCopy;
-  };
-
-  _getSharedToolCenterCandidate = (): Types.Point3 | null => {
-    const frameOfReferenceUID = this._getOwnFrameOfReferenceUID();
-
-    if (frameOfReferenceUID) {
-      const byFrame =
-        CrosshairsTool._sharedCenterByFrameOfReference.get(frameOfReferenceUID);
-      if (byFrame) {
-        return [...byFrame] as Types.Point3;
-      }
-    }
-
-    if (this._lastKnownFrameOfReferenceUID) {
-      const byLastKnown = CrosshairsTool._sharedCenterByFrameOfReference.get(
-        this._lastKnownFrameOfReferenceUID
-      );
-      if (byLastKnown) {
-        return [...byLastKnown] as Types.Point3;
-      }
-    }
-
-    if (CrosshairsTool._sharedCenterByFrameOfReference.size === 1) {
-      const onlyCenter = CrosshairsTool._sharedCenterByFrameOfReference
-        .values()
-        .next().value;
-      if (onlyCenter) {
-        return [...onlyCenter] as Types.Point3;
-      }
-    }
-
-    if (CrosshairsTool._sharedLastCenter) {
-      return [...CrosshairsTool._sharedLastCenter] as Types.Point3;
-    }
-
-    return null;
   };
 
   _isFinitePoint3 = (point: Types.Point3): boolean => {
@@ -4442,8 +4020,13 @@ class CrosshairsTool extends AnnotationTool {
           return;
         }
 
+        const { viewportId, renderingEngineId } = evt.detail;
+        if (viewportId && renderingEngineId) {
+          this._registerViewportWithManager(renderingEngineId, viewportId);
+        }
+
         this._syncVolumeListenersWithToolGroup();
-        this._computeToolCenter(this._getViewportsInfo());
+        this._scheduleDebouncedRecompute();
       }) as EventListener;
       eventTarget.addEventListener(
         Events.TOOLGROUP_VIEWPORT_ADDED,
@@ -4457,24 +4040,16 @@ class CrosshairsTool extends AnnotationTool {
           return;
         }
 
-        this._syncVolumeListenersWithToolGroup();
-
-        if (this.configuration.standalone) {
-          // Re-initialize + re-render every *remaining* viewport in this
-          // toolGroup (not just recompute geometry, which doesn't apply to
-          // `standalone` anyway) — e.g. a viewport being removed here
-          // because it's switching to a different mode/toolGroup (2D -> 3D)
-          // can otherwise leave a sibling viewport's own annotation/render
-          // state looking stale until some unrelated interaction happens to
-          // refresh it.
-          this._computeToolCenter(this._getViewportsInfo());
-          return;
+        const { viewportId, renderingEngineId } = evt.detail;
+        if (viewportId && renderingEngineId) {
+          this._unregisterViewportFromManager(renderingEngineId, viewportId);
         }
 
-        this._recomputeToolCenterFromAbsoluteCameras({
-          emitEvent: true,
-          updateViewportCameras: false,
-        });
+        this._syncVolumeListenersWithToolGroup();
+
+        // Re-initialize + re-render the remaining viewports; removing one
+        // (e.g. 2D -> 3D switch) can leave siblings' state stale otherwise.
+        this._computeToolCenter(this._getViewportsInfo());
       }) as EventListener;
       eventTarget.addEventListener(
         Events.TOOLGROUP_VIEWPORT_REMOVED,
@@ -4483,16 +4058,9 @@ class CrosshairsTool extends AnnotationTool {
     }
 
     if (!this._elementEnabledListener) {
-      // Safety net: `toolGroup.addViewport()` (and the resulting
-      // TOOLGROUP_VIEWPORT_ADDED handling above) can fire *before* the core
-      // rendering engine has actually finished enabling that viewport's
-      // element (e.g. app code wiring up toolGroups while a viewport is
-      // still being created/loaded asynchronously). In that case our
-      // `triggerAnnotationRenderForViewportIds` call silently finds no
-      // enabled element yet and does nothing, and nothing else would ever
-      // retry — leaving the center handle invisible until some unrelated
-      // interaction happens to trigger a re-render. Re-trigger once the
-      // element genuinely becomes available.
+      // Safety net: TOOLGROUP_VIEWPORT_ADDED can fire before the element is
+      // actually enabled, so the initial render finds no enabled element.
+      // Re-trigger once the element becomes available.
       this._elementEnabledListener = ((evt: CustomEvent) => {
         const { viewportId, renderingEngineId } = evt.detail || {};
         if (!viewportId) {
@@ -4519,16 +4087,9 @@ class CrosshairsTool extends AnnotationTool {
     }
 
     if (!this._imageRenderedListener) {
-      // Extra safety net on top of `_elementEnabledListener`: even once an
-      // element is "enabled", a newly-created viewport (e.g. a StackViewport
-      // still loading its first image over the network) may not actually
-      // have anything meaningful to draw for a while, and none of our
-      // earlier render attempts/retries are guaranteed to land inside that
-      // window in every environment. IMAGE_RENDERED fires on every actual
-      // visual paint of a viewport, so re-requesting our own annotation
-      // render whenever it fires for one of our own viewports is a broad,
-      // reliable catch-all — cheap since it just (re-)flags the element for
-      // the next annotation RAF pass rather than doing any real work here.
+      // Extra safety net: IMAGE_RENDERED fires on every actual paint, so
+      // re-requesting our annotation render for our own viewports is a
+      // reliable catch-all for viewports that had nothing to draw earlier.
       this._imageRenderedListener = ((evt: CustomEvent) => {
         const { viewportId, renderingEngineId } = evt.detail || {};
         if (!viewportId || !renderingEngineId) {
@@ -4545,18 +4106,12 @@ class CrosshairsTool extends AnnotationTool {
           return;
         }
 
-        // The first time we see this viewport actually render something for
-        // real, re-run `initializeViewport` for it: its annotation may have
-        // been created (right after being added to the toolGroup) before
-        // this viewport's FrameOfReferenceUID was available/settled, which
-        // can leave it effectively invisible to later lookups. Cheap/safe
-        // to do once; subsequent renders just re-request drawing normally.
+        // First real render for this viewport: re-run initializeViewport once,
+        // since its annotation may have been created before the
+        // FrameOfReferenceUID settled.
         const key = this._toViewportKey(renderingEngineId, viewportId);
-        if (
-          this.configuration.standalone &&
-          !this._standaloneSeenViewports.has(key)
-        ) {
-          this._standaloneSeenViewports.add(key);
+        if (!this._seenStackViewports.has(key)) {
+          this._seenStackViewports.add(key);
           this.initializeViewport({ viewportId, renderingEngineId });
         }
 
@@ -4684,135 +4239,102 @@ class CrosshairsTool extends AnnotationTool {
     this._volumeViewportNewVolumeListeners.clear();
   };
 
-  _calculateToolCenterFromAbsoluteCameras = (): Types.Point3 | null => {
-    const viewportsInfo = this._getViewportsInfo();
-    const referenceCenter =
-      this._isFinitePoint3(this.toolCenter) &&
-      !this._isNearZeroPoint3(this.toolCenter)
-        ? ([...this.toolCenter] as Types.Point3)
-        : this._isFinitePoint3(this._lastValidToolCenter as Types.Point3) &&
-            !this._isNearZeroPoint3(this._lastValidToolCenter as Types.Point3)
-          ? ([...(this._lastValidToolCenter as Types.Point3)] as Types.Point3)
-          : null;
+  _updateToolCenterFromCameraDelta = (
+    viewport: Types.IVolumeViewport,
+    evt: Event
+  ): void => {
+    if (!this._isFinitePoint3(this.toolCenter) || this._isNearZeroPoint3(this.toolCenter)) {
+      this._debugLog('_updateToolCenterFromCameraDelta:skip-uninitialized', {
+        toolCenter: this._formatPoint3(this.toolCenter),
+      });
+      return;
+    }
 
-    const uniquePlanes: Array<{
-      normal: Types.Point3;
-      point: Types.Point3;
-    }> = [];
+    const eventDetail = (evt as CustomEvent).detail;
+    if (!eventDetail?.previousCamera || !eventDetail?.camera) {
+      return;
+    }
 
-    viewportsInfo.forEach((viewportInfo) => {
-      const enabledElement = getEnabledElementByIds(
-        viewportInfo.viewportId,
-        viewportInfo.renderingEngineId
-      );
+    const { previousCamera, camera } = eventDetail;
+    const oldFocalPoint = previousCamera.focalPoint as Types.Point3;
+    const newFocalPoint = camera.focalPoint as Types.Point3;
+    const viewPlaneNormal = camera.viewPlaneNormal as Types.Point3;
 
-      if (!enabledElement) {
-        return;
-      }
+    if (!oldFocalPoint || !newFocalPoint || !viewPlaneNormal) {
+      return;
+    }
 
-      const camera = getViewportICamera(enabledElement.viewport);
+    const delta: Types.Point3 = [
+      newFocalPoint[0] - oldFocalPoint[0],
+      newFocalPoint[1] - oldFocalPoint[1],
+      newFocalPoint[2] - oldFocalPoint[2],
+    ];
 
-      const normal = [...camera.viewPlaneNormal] as Types.Point3;
-      const point = [...camera.focalPoint] as Types.Point3;
+    const deltaLength = Math.sqrt(
+      delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]
+    );
 
-      if (!this._isFinitePoint3(normal) || !this._isFinitePoint3(point)) {
-        return;
-      }
+    if (deltaLength < 1e-3) {
+      return;
+    }
 
-      if (
-        Math.abs(point[0]) < 1e-3 &&
-        Math.abs(point[1]) < 1e-3 &&
-        Math.abs(point[2]) < 1e-3
-      ) {
-        return;
-      }
+    if (deltaLength > 50) {
+      this._debugLog('_updateToolCenterFromCameraDelta:skip-large-delta', {
+        deltaLength,
+        delta: this._formatPoint3(delta),
+      });
+      return;
+    }
 
-      vec3.normalize(normal, normal);
+    const dotProduct =
+      delta[0] * viewPlaneNormal[0] +
+      delta[1] * viewPlaneNormal[1] +
+      delta[2] * viewPlaneNormal[2];
 
-      const existingPlaneIndex = uniquePlanes.findIndex(
-        (plane) =>
-          csUtils.isEqual(plane.normal, normal, 1e-3) ||
-          csUtils.isOpposite(plane.normal, normal, 1e-3)
-      );
+    if (Math.abs(dotProduct) < 1e-3) {
+      return;
+    }
 
-      if (existingPlaneIndex === -1) {
-        uniquePlanes.push({ normal, point });
-        return;
-      }
+    const projectedDelta: Types.Point3 = [
+      dotProduct * viewPlaneNormal[0],
+      dotProduct * viewPlaneNormal[1],
+      dotProduct * viewPlaneNormal[2],
+    ];
 
-      if (!referenceCenter) {
-        return;
-      }
+    const newToolCenter: Types.Point3 = [
+      this.toolCenter[0] + projectedDelta[0],
+      this.toolCenter[1] + projectedDelta[1],
+      this.toolCenter[2] + projectedDelta[2],
+    ];
 
-      const existingPlane = uniquePlanes[existingPlaneIndex];
-      const existingDistanceToReference = Math.abs(
-        vtkMath.dot(existingPlane.normal, [
-          referenceCenter[0] - existingPlane.point[0],
-          referenceCenter[1] - existingPlane.point[1],
-          referenceCenter[2] - existingPlane.point[2],
-        ])
-      );
-
-      const candidateDistanceToReference = Math.abs(
-        vtkMath.dot(existingPlane.normal, [
-          referenceCenter[0] - point[0],
-          referenceCenter[1] - point[1],
-          referenceCenter[2] - point[2],
-        ])
-      );
-
-      if (candidateDistanceToReference < existingDistanceToReference) {
-        existingPlane.point = point;
-      }
+    this._debugLog('_updateToolCenterFromCameraDelta', {
+      oldFocalPoint: this._formatPoint3(oldFocalPoint),
+      newFocalPoint: this._formatPoint3(newFocalPoint),
+      delta: this._formatPoint3(delta),
+      projectedDelta: this._formatPoint3(projectedDelta),
+      oldToolCenter: this._formatPoint3(this.toolCenter),
+      newToolCenter: this._formatPoint3(newToolCenter),
     });
 
-    if (uniquePlanes.length < 2) {
-      return null;
+    // Commit via _commitToolCenter (which calls the manager internally).
+    // Passing the source viewport id prevents the manager from notifying it
+    // back (ping-pong), and _ignoreFiredEvents suppresses the CAMERA_MODIFIED
+    // cascade from the resulting setCamera calls (breaks recursion).
+    const renderingEngineId =
+      (viewport as { renderingEngineId?: string }).renderingEngineId ??
+      this._getViewportsInfo().find((info) => info.viewportId === viewport.id)
+        ?.renderingEngineId;
+
+    const previousIgnoreFiredEvents = this._ignoreFiredEvents;
+    this._ignoreFiredEvents = true;
+    try {
+      this._commitToolCenter(newToolCenter, {
+        senderViewportId: viewport.id,
+        senderRenderingEngineId: renderingEngineId,
+      });
+    } finally {
+      this._ignoreFiredEvents = previousIgnoreFiredEvents;
     }
-
-    const firstPlane = csUtils.planar.planeEquation(
-      uniquePlanes[0].normal,
-      uniquePlanes[0].point
-    );
-    const secondPlane = csUtils.planar.planeEquation(
-      uniquePlanes[1].normal,
-      uniquePlanes[1].point
-    );
-
-    let thirdPlane;
-    if (uniquePlanes.length >= 3) {
-      thirdPlane = csUtils.planar.planeEquation(
-        uniquePlanes[2].normal,
-        uniquePlanes[2].point
-      );
-    } else {
-      const thirdNormal = vec3.create() as Types.Point3;
-      vec3.cross(thirdNormal, uniquePlanes[0].normal, uniquePlanes[1].normal);
-
-      if (vec3.length(thirdNormal) < 1e-6) {
-        return null;
-      }
-
-      vec3.normalize(thirdNormal, thirdNormal);
-
-      const thirdPoint = this._isFinitePoint3(this.toolCenter)
-        ? ([...this.toolCenter] as Types.Point3)
-        : ([
-            (uniquePlanes[0].point[0] + uniquePlanes[1].point[0]) * 0.5,
-            (uniquePlanes[0].point[1] + uniquePlanes[1].point[1]) * 0.5,
-            (uniquePlanes[0].point[2] + uniquePlanes[1].point[2]) * 0.5,
-          ] as Types.Point3);
-
-      thirdPlane = csUtils.planar.planeEquation(thirdNormal, thirdPoint);
-    }
-
-    const center = csUtils.planar.threePlaneIntersection(
-      firstPlane,
-      secondPlane,
-      thirdPlane
-    ) as Types.Point3;
-
-    return this._isFinitePoint3(center) ? center : null;
   };
 
   _recomputeToolCenterFromAbsoluteCameras = ({
@@ -4822,12 +4344,39 @@ class CrosshairsTool extends AnnotationTool {
     emitEvent?: boolean;
     updateViewportCameras?: boolean;
   } = {}): Types.Point3 | null => {
-    let toolCenter = this._calculateToolCenterFromAbsoluteCameras();
+    const viewportsInfo = this._getViewportsInfo();
+    const forUID = this._getOwnFrameOfReferenceUID();
+    const manager = getWorldPointManager();
 
-    // During viewport/toolGroup re-wiring (notably when enabling MPR), camera
-    // geometry can be momentarily incomplete and produce an origin-like center.
-    // If we already have a meaningful center, keep it instead of clobbering it
-    // with [0,0,0]-ish values.
+    const planes: CameraPlane[] = [];
+    viewportsInfo.forEach((viewportInfo) => {
+      const enabledElement = getEnabledElementByIds(
+        viewportInfo.viewportId,
+        viewportInfo.renderingEngineId
+      );
+      if (!enabledElement) {
+        return;
+      }
+      const camera = getViewportICamera(enabledElement.viewport);
+      const normal = [...camera.viewPlaneNormal] as Types.Point3;
+      const point = [...camera.focalPoint] as Types.Point3;
+      if (this._isFinitePoint3(normal) && this._isFinitePoint3(point) && !this._isNearZeroPoint3(point)) {
+        planes.push({ normal, point });
+      }
+    });
+
+    const referencePoint =
+      this._isFinitePoint3(this.toolCenter) && !this._isNearZeroPoint3(this.toolCenter)
+        ? ([...this.toolCenter] as Types.Point3)
+        : this._isFinitePoint3(this._lastValidToolCenter as Types.Point3) &&
+            !this._isNearZeroPoint3(this._lastValidToolCenter as Types.Point3)
+          ? ([...(this._lastValidToolCenter as Types.Point3)] as Types.Point3)
+          : null;
+
+    let toolCenter = forUID
+      ? manager.recomputeFromCameras(forUID, planes, referencePoint)
+      : null;
+
     const currentCenterIsMeaningful =
       this._isFinitePoint3(this.toolCenter) &&
       !this._isNearZeroPoint3(this.toolCenter);
@@ -4851,23 +4400,11 @@ class CrosshairsTool extends AnnotationTool {
         toolCenter = [
           ...(this._lastValidToolCenter as Types.Point3),
         ] as Types.Point3;
-      } else {
-        const sharedCenter = this._getSharedToolCenterCandidate();
-        if (sharedCenter) {
-          toolCenter = sharedCenter;
-        }
       }
     }
 
     if (!toolCenter && this._lastValidToolCenter) {
       toolCenter = [...this._lastValidToolCenter] as Types.Point3;
-    }
-
-    if (!toolCenter) {
-      const sharedCenter = this._getSharedToolCenterCandidate();
-      if (sharedCenter) {
-        toolCenter = sharedCenter;
-      }
     }
 
     if (!toolCenter) {
@@ -4903,10 +4440,11 @@ class CrosshairsTool extends AnnotationTool {
       this._commitToolCenter(toolCenter);
 
       if (emitEvent) {
+        const currentPoint = forUID ? manager.getPoint(forUID) : null;
         triggerEvent(eventTarget, Events.CROSSHAIR_TOOL_CENTER_CHANGED, {
           toolGroupId: this.toolGroupId,
-          toolCenter: this.toolCenter,
-          FrameOfReferenceUID: this._getOwnFrameOfReferenceUID(),
+          toolCenter: currentPoint ?? this.toolCenter,
+          FrameOfReferenceUID: forUID,
         });
       }
     }
