@@ -22,7 +22,7 @@ const DIRECTIONS = {
  *
  */
 class VolumeRotateTool extends BaseTool {
-  static toolName;
+  static toolName = 'VolumeRotate';
   _configuration: unknown;
 
   constructor(
