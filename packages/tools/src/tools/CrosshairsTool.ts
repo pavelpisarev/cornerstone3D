@@ -1415,9 +1415,14 @@ class CrosshairsTool extends AnnotationTool {
 
     const referenceLines = [];
 
+    // 3D viewports have no fixed orientation plane, so reference lines
+    // are not meaningful — only the center handle/point should be drawn.
+    const isCurrentViewport3D = viewport instanceof VolumeViewport3D;
+
     // get canvas information for points and lines (canvas box, canvas horizontal distances)
     const canvasBox = [0, 0, clientWidth, clientHeight];
 
+    if (!isCurrentViewport3D) {
     otherViewportAnnotations.forEach((annotation) => {
       const { data } = annotation;
 
@@ -1429,10 +1434,12 @@ class CrosshairsTool extends AnnotationTool {
 
       // Reference lines / slab-thickness handles are only meaningful for
       // volume viewports with orientation planes. Skip StackViewports (which
-      // have no slab API) to avoid calling volume-only methods on them.
+      // have no slab API) and VolumeViewport3D (which has no fixed orientation
+      // plane) to avoid drawing spurious reference lines in 3D viewports.
       if (
         !otherViewport ||
         otherViewport instanceof StackViewport ||
+        otherViewport instanceof VolumeViewport3D ||
         typeof otherViewport.getSlabThickness !== 'function'
       ) {
         return;
@@ -1776,6 +1783,7 @@ class CrosshairsTool extends AnnotationTool {
         stHandleFour,
       ]);
     });
+    } // end if (!isCurrentViewport3D)
 
     const newRtpoints = [];
     const newStpoints = [];
