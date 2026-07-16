@@ -620,18 +620,6 @@ class ProbeTool extends AnnotationTool {
       if (csUtils.indexWithinDimensions(ijk, dimensions)) {
         this.isHandleOutsideImage = false;
 
-        // Index[2] for stackViewport is always 0, but for visualization
-        // we reset it to be imageId index (skip for ECG; channel is already in ijk[2])
-        if (targetId.startsWith('imageId:') && modality !== 'ECG') {
-          const imageId = targetId.split('imageId:')[1];
-          const imageURI = csUtils.imageIdToURI(imageId);
-          const viewports = csUtils.getViewportsWithImageURI(imageURI);
-
-          const viewport = viewports[0];
-
-          ijk[2] = viewport.getCurrentImageIdIndex();
-        }
-
         let value: number | number[];
         let modalityUnit: string | string[];
 
@@ -662,6 +650,16 @@ class ProbeTool extends AnnotationTool {
             annotation.metadata.referencedImageId,
             pixelUnitsOptions
           );
+        }
+
+        if (targetId.startsWith('imageId:') && modality !== 'ECG') {
+          const imageId = targetId.split('imageId:')[1];
+          const imageURI = csUtils.imageIdToURI(imageId);
+          const viewports = csUtils.getViewportsWithImageURI(imageURI);
+
+          const viewport = viewports[0];
+
+          ijk[2] = viewport.getCurrentImageIdIndex();
         }
 
         cachedStats[targetId] = {
