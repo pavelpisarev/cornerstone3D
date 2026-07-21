@@ -3740,9 +3740,6 @@ class CrosshairsTool extends AnnotationTool {
 
     const { FrameOfReferenceUID, viewport } = enabledElement;
     if (!FrameOfReferenceUID) {
-      console.warn(
-        `[CrosshairsTool] No FrameOfReferenceUID for viewport "${viewportId}". Skipping manager registration.`
-      );
       return;
     }
 
