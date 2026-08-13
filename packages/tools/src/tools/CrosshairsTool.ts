@@ -263,6 +263,9 @@ class CrosshairsTool extends AnnotationTool {
         // Emits verbose console logs for tool-center resolution/sync.
         // Can also be enabled globally via `globalThis.__CROSSHAIRS_DEBUG__ = true`.
         debug: false,
+        // Optional predicate to exclude viewports from crosshairs synchronization.
+        // Receives viewport info and should return true if viewport should participate.
+        viewportFilter: null,
       },
     }
   ) {
@@ -309,6 +312,14 @@ class CrosshairsTool extends AnnotationTool {
     const modality = this._getViewportModality(viewport);
     if (!modality || !getWorldPointManager().isModalitySupported(modality)) {
       return;
+    }
+
+    const viewportFilter = this.configuration?.viewportFilter;
+    if (typeof viewportFilter === 'function') {
+      const imageId = this._getViewportImageId(viewport);
+      if (!viewportFilter({ viewportId, modality, imageId })) {
+        return;
+      }
     }
 
     const { position, focalPoint, viewPlaneNormal } =
@@ -3747,6 +3758,14 @@ class CrosshairsTool extends AnnotationTool {
     const viewportType = viewport instanceof StackViewport ? 'stack' : 'volume';
     const modality = this._getViewportModality(viewport);
 
+    const viewportFilter = this.configuration?.viewportFilter;
+    if (typeof viewportFilter === 'function') {
+      const imageId = this._getViewportImageId(viewport);
+      if (!viewportFilter({ viewportId, modality, imageId })) {
+        return;
+      }
+    }
+
     manager.registerViewport(FrameOfReferenceUID, {
       viewportId,
       renderingEngineId,
@@ -3932,6 +3951,19 @@ class CrosshairsTool extends AnnotationTool {
     if (viewport?.modality) {
       return viewport.modality;
     }
+    return undefined;
+  };
+
+  _getViewportImageId = (viewport: unknown): string | undefined => {
+    try {
+      if (viewport instanceof StackViewport) {
+        const imageIds = viewport.getImageIds?.();
+        if (!imageIds?.length) return undefined;
+        return viewport.getCurrentImageId?.() ?? imageIds[0];
+      }
+      const imageIds = (viewport as { getImageIds?: () => string[] })?.getImageIds?.();
+      return imageIds?.[0];
+    } catch {}
     return undefined;
   };
 
