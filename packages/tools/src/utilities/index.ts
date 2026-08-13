@@ -23,6 +23,7 @@ import { getSphereBoundsInfo } from './getSphereBoundsInfo';
 import { pointToString } from './pointToString';
 import AnnotationMultiSlice from './AnnotationMultiSlice';
 import getViewportForAnnotation from './getViewportForAnnotation';
+import getViewportsForAnnotation from './getViewportsForAnnotation';
 import {
   annotationHydration,
   getClosestImageIdForStackViewport,
@@ -89,6 +90,7 @@ export {
   getSphereBoundsInfo,
   getAnnotationNearPoint,
   getViewportForAnnotation,
+  getViewportsForAnnotation,
   getAnnotationNearPointOnEnabledElement,
   viewport,
   cine,
