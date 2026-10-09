@@ -12,7 +12,10 @@ const { RENDERING_DEFAULTS } = CONSTANTS;
  * for native (Generic) viewports which have no slab API.
  */
 export function getSlabThicknessOrDefault(viewport: Types.IViewport): number {
-  if (csUtils.isGenericViewport(viewport)) {
+  if (
+    csUtils.isGenericViewport(viewport) ||
+    typeof (viewport as Types.IVolumeViewport).getSlabThickness !== 'function'
+  ) {
     return RENDERING_DEFAULTS.MINIMUM_SLAB_THICKNESS;
   }
   return (viewport as Types.IVolumeViewport).getSlabThickness();

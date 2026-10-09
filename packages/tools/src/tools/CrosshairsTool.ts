@@ -13,6 +13,8 @@ import {
   CONSTANTS,
   triggerEvent,
   eventTarget,
+  StackViewport,
+  VolumeViewport3D,
 } from '@cornerstonejs/core';
 
 import {
@@ -45,6 +47,7 @@ import {
   jumpToFocalPoint,
 } from '../utilities/genericViewportToolHelpers';
 import { isMobile } from '../utilities/touch';
+import { getWorldPointManager, type CameraPlane } from './WorldPointManager';
 
 import * as lineSegment from '../utilities/math/line';
 import type {
@@ -69,12 +72,9 @@ const cs3dLogger = cornerstoneUtilities.logger.toolsLog.getLogger(
 const { RENDERING_DEFAULTS } = CONSTANTS;
 
 /**
- * Displayed canvas size for crosshairs geometry. Native ("next") viewports render to
- * a separate visible canvas (e.g. the CPU canvas); their `viewport.canvas` is the
- * hidden cornerstone-canvas (display:none -> clientWidth/clientHeight === 0), which
- * would collapse the reference-line extents. worldToCanvas already returns coordinates
- * in the element's displayed space, so use the element size for native; legacy keeps
- * the canvas size (byte-identical).
+ * Displayed canvas size for crosshairs geometry. Native viewports use the
+ * element size (their `viewport.canvas` is hidden -> 0x0); legacy uses the
+ * canvas size.
  */
 function getDisplayedCanvasSize(viewport): {
   clientWidth: number;
@@ -151,8 +151,23 @@ class CrosshairsTool extends AnnotationTool {
     ['Minimal 80px', { enabled: true, lineLengthInPx: 80 }],
   ]);
 
-  toolCenter: Types.Point3 = [0, 0, 0]; // NOTE: it is assumed that all the active/linked viewports share the same crosshair center.
-  // This because the rotation operation rotates also all the other active/intersecting reference lines of the same angle
+  _localToolCenter: Types.Point3 = [0, 0, 0];
+  get toolCenter(): Types.Point3 {
+    const forUID = this._getOwnFrameOfReferenceUID();
+    if (forUID) {
+      const manager = getWorldPointManager();
+      const point = manager.getPoint(forUID);
+      if (point) {
+        return point;
+      }
+    }
+    return this._localToolCenter;
+  }
+  set toolCenter(point: Types.Point3) {
+    this._localToolCenter = [...point] as Types.Point3;
+  }
+  _lastValidToolCenter: Types.Point3 | null = null;
+  _lastKnownFrameOfReferenceUID: string | null = null;
   _getReferenceLineColor?: (viewportId: string) => string;
   _getReferenceLineControllable?: (viewportId: string) => boolean;
   _getReferenceLineDraggableRotatable?: (viewportId: string) => boolean;
@@ -166,7 +181,24 @@ class CrosshairsTool extends AnnotationTool {
   >();
   _toolGroupViewportAddedListener: EventListener | null = null;
   _toolGroupViewportRemovedListener: EventListener | null = null;
+  _elementEnabledListener: EventListener | null = null;
+  _imageRenderedListener: EventListener | null = null;
   _ignoreFiredEvents = false;
+  // Raw STACK_NEW_IMAGE listeners (one per StackViewport) to detect slice/scroll changes.
+  _stackImageListeners: Map<
+    string,
+    { element: HTMLDivElement; listener: EventListener }
+  > = new Map();
+  // StackViewports for which at least one real (loaded) image has been processed.
+  _seenStackViewports: Set<string> = new Set();
+  // Slice index last programmatically requested via setImageIdIndex() per
+  // StackViewport; used to recognize and ignore the resulting async
+  // STACK_NEW_IMAGE as our own doing (feedback-loop guard).
+  _pendingProgrammaticSliceIndex: Map<string, number> = new Map();
+  // Debounce handle: coalesces rapid TOOLGROUP_VIEWPORT_ADDED events (e.g. MPR
+  // triad) into a single _computeToolCenter call once cameras have settled.
+  _debouncedRecomputeHandle: ReturnType<typeof setTimeout> | null = null;
+  _debounceDelayMs = 150;
 
   constructor(
     toolProps: PublicToolProps = {},
@@ -179,16 +211,12 @@ class CrosshairsTool extends AnnotationTool {
         viewportIndicators: false,
 
         viewportIndicatorsConfig: {
-          radius: 5,
-          x: null,
-          y: null,
+          circleRadius: 5,
+          xOffset: null,
+          yOffset: null,
         },
-        // Auto pan is a configuration which will update pan
-        // other viewports in the toolGroup if the center of the crosshairs
-        // is outside of the viewport. This might be useful for the case
-        // when the user is scrolling through an image (usually in the zoomed view)
-        // and the crosshairs will eventually get outside of the viewport for
-        // the other viewports.
+        // Pans other viewports in the toolGroup when the crosshairs center
+        // moves outside their bounds (e.g. while scrolling a zoomed view).
         autoPan: {
           enabled: false,
           panSize: 10,
@@ -224,12 +252,26 @@ class CrosshairsTool extends AnnotationTool {
           color: 'rgba(255, 255, 0, 0.5)',
           size: 2,
         },
+        // Grabbable circle handle at the tool center for translating the whole
+        // crosshair (all linked viewports). Works in Active and Passive modes.
+        centerHandle: {
+          enabled: true,
+          // Visual + hit-test radius (canvas px). Falls back to `handleRadius`.
+          radius: null,
+          color: null,
+        },
         mobile: {
           enabled: isMobile(),
           opacity: 0.8,
           handleRadius: 9,
           referenceLinesCenterGapRatio: 0.05,
         },
+        // Emits verbose console logs for tool-center resolution/sync.
+        // Can also be enabled globally via `globalThis.__CROSSHAIRS_DEBUG__ = true`.
+        debug: false,
+        // Optional predicate to exclude viewports from crosshairs synchronization.
+        // Receives viewport info and should return true if viewport should participate.
+        viewportFilter: null,
       },
     }
   ) {
@@ -272,6 +314,20 @@ class CrosshairsTool extends AnnotationTool {
     }
     const { FrameOfReferenceUID, viewport } = enabledElement;
     const { element } = viewport;
+
+    const modality = this._getViewportModality(viewport);
+    if (!modality || !getWorldPointManager().isModalitySupported(modality)) {
+      return;
+    }
+
+    const viewportFilter = this.configuration?.viewportFilter;
+    if (typeof viewportFilter === 'function') {
+      const imageId = this._getViewportImageId(viewport);
+      if (!viewportFilter({ viewportId, modality, imageId })) {
+        return;
+      }
+    }
+
     const { position, focalPoint, viewPlaneNormal } =
       getViewportICamera(viewport);
 
@@ -309,6 +365,8 @@ class CrosshairsTool extends AnnotationTool {
 
     addAnnotation(annotation, element);
 
+    this._registerViewportWithManager(renderingEngineId, viewportId);
+
     const { clientWidth, clientHeight } = getDisplayedCanvasSize(viewport);
     return {
       normal: viewPlaneNormal,
@@ -317,15 +375,19 @@ class CrosshairsTool extends AnnotationTool {
   };
 
   _getViewportsInfo = () => {
-    const viewports = getToolGroup(this.toolGroupId).viewportsInfo;
+    // Тул-группа может быть уже уничтожена (например, глобальный слушатель
+    // ELEMENT_ENABLED сработал после ToolGroupManager.destroy) - без guard
+    // чтение viewportsInfo падает на undefined
+    const toolGroup = getToolGroup(this.toolGroupId);
 
-    return viewports;
+    return toolGroup?.viewportsInfo ?? [];
   };
 
   _reinitializeListenersAndCenter = (): void => {
     this._unbindToolGroupViewportListeners();
     this._clearAllVolumeListenersAndViewportState();
     this._bindToolGroupViewportListeners();
+    this._registerAllViewportsWithManager();
     this._syncVolumeListenersWithToolGroup();
     this._computeToolCenter(this._getViewportsInfo());
   };
@@ -345,8 +407,11 @@ class CrosshairsTool extends AnnotationTool {
   onSetToolDisabled() {
     const viewportsInfo = this._getViewportsInfo();
 
+    this._unregisterAllViewportsFromManager();
     this._unbindToolGroupViewportListeners();
     this._clearAllVolumeListenersAndViewportState();
+    this._unbindStackImageListeners();
+    this._cancelDebouncedRecompute();
     this._ignoreFiredEvents = false;
     this.editData = null;
     state.isInteractingWithTool = false;
@@ -394,9 +459,8 @@ class CrosshairsTool extends AnnotationTool {
       const resetRotation = true;
       const suppressEvents = true;
       if (csUtils.isGenericViewport(viewport)) {
-        // Native PLANAR_NEXT has no resetCamera/resetSlabThickness; resetViewState
-        // resets pan/zoom/orientation/flip (slice/navigation is preserved and there
-        // is no slab concept). Wrapped by the caller's _ignoreFiredEvents guard.
+        // Native PLANAR_NEXT has no resetCamera/resetSlabThickness; use
+        // resetViewState (slice/navigation is preserved, no slab concept).
         viewport.resetViewState({
           resetPan,
           resetZoom,
@@ -428,11 +492,6 @@ class CrosshairsTool extends AnnotationTool {
     this._computeToolCenter(viewportsInfo);
   };
 
-  computeToolCenter = () => {
-    const viewportsInfo = this._getViewportsInfo();
-    this._computeToolCenter(viewportsInfo);
-  };
-
   /**
    * When activated, it initializes the crosshairs. It begins by computing
    * the intersection of viewports associated with the crosshairs instance.
@@ -443,10 +502,16 @@ class CrosshairsTool extends AnnotationTool {
    * @param viewportsInfo Array of viewportInputs which each item containing `{viewportId, renderingEngineId}`
    */
   _computeToolCenter = (viewportsInfo): void => {
-    if (!viewportsInfo.length || viewportsInfo.length === 1) {
-      cs3dLogger.warn(
-        'For crosshairs to operate, at least two viewports must be given.'
-      );
+    this._debugLog('_computeToolCenter:start', {
+      viewportsCount: viewportsInfo?.length ?? 0,
+      toolCenter: this._formatPoint3(this.toolCenter),
+      lastValidToolCenter: this._formatPoint3(this._lastValidToolCenter),
+      ownFrameOfReferenceUID: this._getOwnFrameOfReferenceUID(),
+      viewports: this._getViewportsDebugInfo(viewportsInfo || []),
+    });
+
+    if (!viewportsInfo.length) {
+      this._debugLog('_computeToolCenter:skip:no-viewports');
       return;
     }
 
@@ -454,10 +519,199 @@ class CrosshairsTool extends AnnotationTool {
       this.initializeViewport(viewportInfo);
     });
 
-    this._recomputeToolCenterFromAbsoluteCameras({
+    // Keep the per-viewport STACK_NEW_IMAGE listeners (reverse-sync for
+    // scrolling — see `_handleStackNewImage`) in sync with the current
+    // viewport membership. Cheap/idempotent; only binds to StackViewports.
+    this._syncStackImageListeners(viewportsInfo);
+
+    // Every viewport is a subscriber to the shared point of its
+    // FrameOfReferenceUID. Adopt the manager's point if it has one, else reuse
+    // the last-known-valid center, else initialize from the own focal point.
+    const forUID = this._getOwnFrameOfReferenceUID();
+    const manager = getWorldPointManager();
+    const sharedCenter = forUID ? manager.getPoint(forUID) : null;
+    if (sharedCenter) {
+      this._debugLog('_computeToolCenter:using-manager-point', {
+        sharedCenter: this._formatPoint3(sharedCenter),
+      });
+      this._commitToolCenter(sharedCenter);
+      this.setToolCenter(sharedCenter, /* suppressEvents = */ true);
+      triggerAnnotationRenderForViewportIds(
+        viewportsInfo.map(({ viewportId }) => viewportId)
+      );
+      return;
+    }
+
+    // 2+ orthogonal viewports: derive the center from their camera plane
+    // intersection. Returns null for a single viewport (falls through below).
+    const recomputed = this._recomputeToolCenterFromAbsoluteCameras({
       emitEvent: true,
       updateViewportCameras: true,
     });
+
+    if (!recomputed) {
+      if (this._lastValidToolCenter) {
+        this._commitToolCenter(this._lastValidToolCenter);
+        this._syncStackSlices(viewportsInfo, this.toolCenter);
+      } else {
+        this._initializeToolCenterFromOwnViewport(viewportsInfo);
+      }
+      triggerAnnotationRenderForViewportIds(
+        viewportsInfo.map(({ viewportId }) => viewportId)
+      );
+    }
+
+    this._debugLog('_computeToolCenter:end', {
+      toolCenter: this._formatPoint3(this.toolCenter),
+      lastValidToolCenter: this._formatPoint3(this._lastValidToolCenter),
+    });
+  };
+
+  /**
+   * Returns the FrameOfReferenceUID shared by this toolGroup's viewports, or
+   * the last-known one / undefined if none is currently determinable.
+   */
+  _getOwnFrameOfReferenceUID = (): string | undefined => {
+    const viewportsInfo = this._getViewportsInfo();
+    for (const { viewportId, renderingEngineId } of viewportsInfo) {
+      const enabledElement = getEnabledElementByIds(
+        viewportId,
+        renderingEngineId
+      );
+      if (enabledElement?.FrameOfReferenceUID) {
+        this._lastKnownFrameOfReferenceUID = enabledElement.FrameOfReferenceUID;
+        return enabledElement.FrameOfReferenceUID;
+      }
+    }
+    return this._lastKnownFrameOfReferenceUID ?? undefined;
+  };
+
+  /**
+   * Final fallback: initializes the shared tool center from the own
+   * viewport's camera focal point (defined for every viewport type).
+   */
+  _initializeToolCenterFromOwnViewport = (
+    viewportsInfo: { viewportId: string; renderingEngineId: string }[]
+  ): void => {
+    for (const { viewportId, renderingEngineId } of viewportsInfo) {
+      const enabledElement = getEnabledElementByIds(
+        viewportId,
+        renderingEngineId
+      );
+      if (!enabledElement) {
+        continue;
+      }
+
+      const camera = getViewportICamera(enabledElement.viewport);
+      const focalPoint = camera?.focalPoint as Types.Point3 | undefined;
+      if (!focalPoint || !this._isFinitePoint3(focalPoint)) {
+        continue;
+      }
+
+      const forUID = enabledElement.FrameOfReferenceUID;
+      if (forUID) {
+        const manager = getWorldPointManager();
+        manager.initializePoint(forUID, focalPoint);
+      }
+      this._commitToolCenter(focalPoint);
+      return;
+    }
+  };
+
+  /**
+   * Schedules a debounced _computeToolCenter call. When multiple viewports
+   * are added rapidly (e.g. MPR triad: axial+sagittal+coronal), this
+   * coalesces them into a single recompute after the debounce delay,
+   * allowing cameras to settle before computing the intersection.
+   */
+  _scheduleDebouncedRecompute = (): void => {
+    if (this._debouncedRecomputeHandle) {
+      clearTimeout(this._debouncedRecomputeHandle);
+    }
+
+    this._debouncedRecomputeHandle = setTimeout(() => {
+      this._debouncedRecomputeHandle = null;
+      this._computeToolCenter(this._getViewportsInfo());
+    }, this._debounceDelayMs);
+  };
+
+  _cancelDebouncedRecompute = (): void => {
+    if (this._debouncedRecomputeHandle) {
+      clearTimeout(this._debouncedRecomputeHandle);
+      this._debouncedRecomputeHandle = null;
+    }
+  };
+
+  /**
+   * Auto-scrolls any StackViewport(s) to the image index closest to
+   * `worldPoint`, only if it differs from the currently displayed one.
+   * Volume/Volume3D viewports are left untouched (no per-slice concept).
+   */
+  _syncStackSlices = (
+    viewportsInfo: { viewportId: string; renderingEngineId: string }[],
+    worldPoint: Types.Point3,
+    excludeKey?: string
+  ): void => {
+    // setImageIdIndex() below fires STACK_NEW_IMAGE, which our own
+    // _handleStackNewImage would misread as a user scroll and re-broadcast a
+    // tool center shift (feedback loop). Guard against that.
+    const previousIgnoreFiredEvents = this._ignoreFiredEvents;
+    this._ignoreFiredEvents = true;
+    try {
+      viewportsInfo.forEach(({ viewportId, renderingEngineId }) => {
+        const key = this._toViewportKey(renderingEngineId, viewportId);
+        // Never auto-scroll the viewport being dragged (or otherwise
+        // excluded): it must stay on the slice the user is looking at.
+        if (excludeKey && key === excludeKey) {
+          return;
+        }
+
+        const enabledElement = getEnabledElementByIds(
+          viewportId,
+          renderingEngineId
+        );
+        if (!enabledElement) {
+          return;
+        }
+
+        const { viewport } = enabledElement;
+        if (!(viewport instanceof StackViewport)) {
+          return;
+        }
+
+        const closestIndex = csUtils.getClosestStackImageIndexForPoint(
+          worldPoint,
+          viewport
+        );
+
+        if (
+          closestIndex === null ||
+          closestIndex === undefined ||
+          closestIndex === viewport.getCurrentImageIdIndex()
+        ) {
+          return;
+        }
+
+        // setImageIdIndex() fires STACK_NEW_IMAGE asynchronously, after the
+        // _ignoreFiredEvents guard is reset. Record the requested index so
+        // _handleStackNewImage can recognize and ignore exactly that transition.
+        if (this._stackImageListeners.has(key)) {
+          this._pendingProgrammaticSliceIndex.set(key, closestIndex);
+        }
+
+        this._debugLog('_syncStackSlices:setImageIdIndex', {
+          viewportId,
+          from: viewport.getCurrentImageIdIndex(),
+          to: closestIndex,
+          worldPoint: this._formatPoint3(worldPoint),
+        });
+
+        viewport.setImageIdIndex(closestIndex);
+        viewport.render();
+      });
+    } finally {
+      this._ignoreFiredEvents = previousIgnoreFiredEvents;
+    }
   };
 
   setToolCenter(toolCenter: Types.Point3, suppressEvents = false): void {
@@ -479,27 +733,29 @@ class CrosshairsTool extends AnnotationTool {
         const camera = getViewportICamera(viewport);
         const { focalPoint, position, viewPlaneNormal } = camera;
 
-        // Calculate the delta between the current camera focal point and the new tool center
         const delta = [
           toolCenter[0] - focalPoint[0],
           toolCenter[1] - focalPoint[1],
           toolCenter[2] - focalPoint[2],
         ];
 
-        // Project this vector onto the view plane normal.
-        // This isolates the component of the movement that corresponds to the "scroll" (slice change).
-        const scroll =
-          delta[0] * viewPlaneNormal[0] +
-          delta[1] * viewPlaneNormal[1] +
-          delta[2] * viewPlaneNormal[2];
+        // Project the delta onto the viewport's own view plane normal so we
+        // only "scroll" the reformat plane to the slice containing the tool
+        // center (as MPR does), never panning it in-plane. StackViewports snap
+        // to the closest slice separately via `_syncStackSlices`.
+        const scrollDelta = (() => {
+          const scroll =
+            delta[0] * viewPlaneNormal[0] +
+            delta[1] * viewPlaneNormal[1] +
+            delta[2] * viewPlaneNormal[2];
 
-        const scrollDelta = [
-          scroll * viewPlaneNormal[0],
-          scroll * viewPlaneNormal[1],
-          scroll * viewPlaneNormal[2],
-        ];
+          return [
+            scroll * viewPlaneNormal[0],
+            scroll * viewPlaneNormal[1],
+            scroll * viewPlaneNormal[2],
+          ];
+        })();
 
-        // Apply this "scroll" to the position and focal point of the camera.
         const newFocalPoint: Types.Point3 = [
           focalPoint[0] + scrollDelta[0],
           focalPoint[1] + scrollDelta[1],
@@ -512,8 +768,6 @@ class CrosshairsTool extends AnnotationTool {
         ];
 
         if (csUtils.isGenericViewport(viewport)) {
-          // Native PLANAR_NEXT has no setCamera; the move is purely along the view
-          // plane normal (a scroll), so navigate by view reference (snaps to slice).
           jumpToFocalPoint(viewport, newFocalPoint);
         } else {
           viewport.setCamera({
@@ -528,12 +782,16 @@ class CrosshairsTool extends AnnotationTool {
       this._ignoreFiredEvents = previousIgnoreFiredEvents;
     }
 
-    this.toolCenter = toolCenter;
+    this._commitToolCenter(toolCenter);
 
     if (!suppressEvents) {
+      const forUID = this._getOwnFrameOfReferenceUID();
+      const manager = getWorldPointManager();
+      const currentPoint = forUID ? manager.getPoint(forUID) : null;
       triggerEvent(eventTarget, Events.CROSSHAIR_TOOL_CENTER_CHANGED, {
         toolGroupId: this.toolGroupId,
-        toolCenter: this.toolCenter,
+        toolCenter: currentPoint ?? this.toolCenter,
+        FrameOfReferenceUID: forUID,
       });
     }
   }
@@ -551,6 +809,17 @@ class CrosshairsTool extends AnnotationTool {
   ): CrosshairsAnnotation => {
     const eventDetail = evt.detail;
     const { element } = eventDetail;
+
+    const enabledElementForModality = getEnabledElement(element);
+    if (enabledElementForModality?.viewport) {
+      const modality = this._getViewportModality(
+        enabledElementForModality.viewport
+      );
+      if (!modality || !getWorldPointManager().isModalitySupported(modality)) {
+        evt.preventDefault();
+        return null;
+      }
+    }
 
     const { currentPoints } = eventDetail;
     const jumpWorld = currentPoints.world;
@@ -661,11 +930,9 @@ class CrosshairsTool extends AnnotationTool {
     const { element } = eventDetail;
     annotation.highlighted = true;
 
-    // NOTE: handle index or coordinates are not used when dragging.
-    // This because the handle points are actually generated in the renderTool and they are a derivative
-    // from the camera variables of the viewports and of the slab thickness variable.
-    // Remember that the translation and rotation operations operate on the camera
-    // variables and not really on the handles. Similar for the slab thickness.
+    // NOTE: handle index/coordinates aren't used when dragging — translation,
+    // rotation and slab thickness operate on the camera variables, not handles
+    // (handle points are derived in renderTool from the cameras).
     this._activateModify(element, evt);
 
     hideElementCursor(element);
@@ -688,9 +955,17 @@ class CrosshairsTool extends AnnotationTool {
     element: HTMLDivElement,
     annotation: CrosshairsAnnotation,
     canvasCoords: Types.Point2,
-    proximity: number
+    _proximity: number
   ): boolean => {
-    if (this._pointNearTool(element, annotation, canvasCoords, proximity)) {
+    const enabledElement = getEnabledElement(element);
+    if (enabledElement?.viewport) {
+      const modality = this._getViewportModality(enabledElement.viewport);
+      if (!modality || !getWorldPointManager().isModalitySupported(modality)) {
+        return false;
+      }
+    }
+
+    if (this._pointNearTool(element, annotation, canvasCoords, 6)) {
       return true;
     }
 
@@ -700,7 +975,7 @@ class CrosshairsTool extends AnnotationTool {
   toolSelectedCallback = (
     evt: EventTypes.InteractionEventType,
     annotation: Annotation,
-    interactionType: InteractionTypes
+    _interactionType: InteractionTypes
   ): void => {
     const eventDetail = evt.detail;
     const { element } = eventDetail;
@@ -753,10 +1028,16 @@ class CrosshairsTool extends AnnotationTool {
       ];
     }
 
-    this._recomputeToolCenterFromAbsoluteCameras({
-      emitEvent: true,
-      updateViewportCameras: false,
-    });
+    // Only MPR reformat VolumeViewports update the shared point from a camera
+    // delta. StackViewport slice changes are handled via STACK_NEW_IMAGE
+    // (`_handleStackNewImage`), and VolumeViewport3D free-orbit moves must
+    // never alter the point (they only re-project it on the next render).
+    if (
+      !(viewport instanceof StackViewport) &&
+      !(viewport instanceof VolumeViewport3D)
+    ) {
+      this._updateToolCenterFromCameraDelta(viewport, evt);
+    }
 
     // AutoPan modification
     if (this.configuration.autoPan?.enabled) {
@@ -784,7 +1065,207 @@ class CrosshairsTool extends AnnotationTool {
     triggerAnnotationRenderForViewportIds(viewportIdsToRender);
   };
 
-  onResetCamera = (evt) => {
+  /**
+   * Keeps `_stackImageListeners` in sync with the toolGroup's current
+   * StackViewport membership. Safe/cheap to call repeatedly.
+   */
+  _syncStackImageListeners = (viewportsInfo): void => {
+    const currentKeys = new Set<string>();
+
+    viewportsInfo.forEach(({ viewportId, renderingEngineId }) => {
+      const key = this._toViewportKey(renderingEngineId, viewportId);
+      currentKeys.add(key);
+
+      if (this._stackImageListeners.has(key)) {
+        return;
+      }
+
+      const enabledElement = getEnabledElementByIds(
+        viewportId,
+        renderingEngineId
+      );
+      if (!enabledElement) {
+        return;
+      }
+
+      const { viewport } = enabledElement;
+      if (!(viewport instanceof StackViewport)) {
+        return;
+      }
+
+      const { element } = viewport;
+      const listener = ((evt: CustomEvent) => {
+        this._handleStackNewImage(key, viewportId, viewport, evt.detail);
+      }) as EventListener;
+
+      element.addEventListener(Enums.Events.STACK_NEW_IMAGE, listener);
+      this._stackImageListeners.set(key, { element, listener });
+
+      // Mark as "seen" only if an image is already loaded; otherwise leave it
+      // unseen so _handleStackNewImage's "first image seen" branch handles it
+      // once the image finishes loading.
+      if (viewport.getImageData?.()) {
+        this._seenStackViewports.add(key);
+      }
+    });
+
+    for (const [key, { element, listener }] of this._stackImageListeners) {
+      if (!currentKeys.has(key)) {
+        element.removeEventListener(Enums.Events.STACK_NEW_IMAGE, listener);
+        this._stackImageListeners.delete(key);
+        this._seenStackViewports.delete(key);
+      }
+    }
+  };
+
+  _unbindStackImageListeners = (): void => {
+    for (const { element, listener } of this._stackImageListeners.values()) {
+      element.removeEventListener(Enums.Events.STACK_NEW_IMAGE, listener);
+    }
+    this._stackImageListeners.clear();
+    this._seenStackViewports.clear();
+    this._pendingProgrammaticSliceIndex.clear();
+  };
+
+  /**
+   * Reverse sync for StackViewports: when the user scrolls a stack's series,
+   * shift the shared tool center along that viewport's view plane normal and
+   * broadcast it outward. Listens to STACK_NEW_IMAGE (not CAMERA_MODIFIED)
+   * since stack scrolling doesn't reliably fire CAMERA_MODIFIED.
+   */
+  _handleStackNewImage = (
+    key: string,
+    viewportId: string,
+    viewport,
+    eventDetail?: { imageIdIndex?: number }
+  ): void => {
+    // Guard against our own programmatic setImageIdIndex() calls if they
+    // resolve synchronously (the async case is handled just below).
+    if (this._ignoreFiredEvents) {
+      return;
+    }
+
+    // The programmatic setImageIdIndex() (see _syncStackSlices) fires
+    // STACK_NEW_IMAGE asynchronously, after _ignoreFiredEvents was reset.
+    // Recognize and ignore exactly the transition we requested.
+    const expectedIndex = this._pendingProgrammaticSliceIndex.get(key);
+    if (expectedIndex !== undefined) {
+      this._pendingProgrammaticSliceIndex.delete(key);
+      if (eventDetail?.imageIdIndex === expectedIndex) {
+        // Our own programmatic slice snap; must not overwrite the manager point.
+        return;
+      }
+      // Otherwise the user scrolled again before it finished loading — treat
+      // this image as genuine.
+    }
+
+    const camera = getViewportICamera(viewport);
+    const newFocalPoint = camera?.focalPoint as Types.Point3 | undefined;
+    if (!newFocalPoint || !this._isFinitePoint3(newFocalPoint)) {
+      return;
+    }
+
+    this._debugLog('_handleStackNewImage:user-scroll', {
+      viewportId,
+      imageIdIndex: eventDetail?.imageIdIndex,
+      newFocalPoint: this._formatPoint3(newFocalPoint),
+      toolCenter: this._formatPoint3(this.toolCenter),
+    });
+
+    // First image ever seen for this viewport — nothing to compare against
+    // yet, and its camera/FrameOfReferenceUID have just settled to real
+    // values. Re-run initializeViewport to recreate the annotation with a
+    // fresh FrameOfReferenceUID, then request a render.
+    const isFirstImageSeen = !this._seenStackViewports.has(key);
+    this._seenStackViewports.add(key);
+    if (isFirstImageSeen) {
+      const renderingEngineId = this._getViewportsInfo().find(
+        (info) => info.viewportId === viewportId
+      )?.renderingEngineId;
+      if (renderingEngineId) {
+        this.initializeViewport({ viewportId, renderingEngineId });
+      }
+
+      const forUID = this._getOwnFrameOfReferenceUID();
+      const manager = getWorldPointManager();
+      if (
+        (forUID && !manager.isInitialized(forUID)) ||
+        !this._isFinitePoint3(this.toolCenter) ||
+        this._isNearZeroPoint3(this.toolCenter)
+      ) {
+        if (forUID) {
+          manager.initializePoint(forUID, newFocalPoint);
+        }
+        this._commitToolCenter(newFocalPoint);
+      }
+
+      triggerAnnotationRenderForViewportIds([viewportId]);
+      return;
+    }
+
+    // Self-correct rather than diffing against a stale camera snapshot:
+    // measure how far the shared tool center currently sits from this
+    // viewport's slice plane (along its normal) and shift by exactly that.
+    // Idempotent and always relative to the latest state.
+    const { viewPlaneNormal } = camera;
+    const toCenterDelta: Types.Point3 = [
+      newFocalPoint[0] - this.toolCenter[0],
+      newFocalPoint[1] - this.toolCenter[1],
+      newFocalPoint[2] - this.toolCenter[2],
+    ];
+
+    const distanceAlongNormal =
+      toCenterDelta[0] * viewPlaneNormal[0] +
+      toCenterDelta[1] * viewPlaneNormal[1] +
+      toCenterDelta[2] * viewPlaneNormal[2];
+
+    // Already on (or very close to) the slice the shared tool center
+    // already points to — nothing to do (also naturally covers the case
+    // where this event is a redundant re-fire).
+    if (Math.abs(distanceAlongNormal) < 1e-2) {
+      return;
+    }
+
+    const shift: Types.Point3 = [
+      distanceAlongNormal * viewPlaneNormal[0],
+      distanceAlongNormal * viewPlaneNormal[1],
+      distanceAlongNormal * viewPlaneNormal[2],
+    ];
+
+    const newToolCenter: Types.Point3 = [
+      this.toolCenter[0] + shift[0],
+      this.toolCenter[1] + shift[1],
+      this.toolCenter[2] + shift[2],
+    ];
+
+    const forUID = this._getOwnFrameOfReferenceUID();
+    const manager = getWorldPointManager();
+    const renderingEngineId = this._getViewportsInfo().find(
+      (info) => info.viewportId === viewportId
+    )?.renderingEngineId;
+
+    // Update the shared point in the manager (source of truth); it notifies
+    // every other subscriber. We deliberately don't call _syncStackSlices for
+    // this viewport — it's already on the correct slice.
+    this._commitToolCenter(newToolCenter, {
+      senderViewportId: viewportId,
+      senderRenderingEngineId: renderingEngineId,
+    });
+
+    triggerEvent(eventTarget, Events.CROSSHAIR_TOOL_CENTER_CHANGED, {
+      toolGroupId: this.toolGroupId,
+      toolCenter: forUID
+        ? (manager.getPoint(forUID) ?? newToolCenter)
+        : newToolCenter,
+      FrameOfReferenceUID: forUID,
+    });
+
+    triggerAnnotationRenderForViewportIds(
+      this._getViewportsInfo().map(({ viewportId }) => viewportId)
+    );
+  };
+
+  onResetCamera = (_evt) => {
     this.resetCrosshairs();
   };
 
@@ -799,6 +1280,20 @@ class CrosshairsTool extends AnnotationTool {
     const { element, currentPoints } = evt.detail;
     const canvasCoords = currentPoints.canvas;
     let imageNeedsUpdate = false;
+
+    const enabledElement = getEnabledElement(element);
+    if (enabledElement?.viewport) {
+      const modality = this._getViewportModality(enabledElement.viewport);
+      if (!modality || !getWorldPointManager().isModalitySupported(modality)) {
+        return imageNeedsUpdate;
+      }
+    }
+
+    // `filteredToolAnnotations` can be undefined when there is no annotation
+    // for this element yet (e.g. before initializeViewport has run).
+    if (!filteredToolAnnotations?.length) {
+      return imageNeedsUpdate;
+    }
 
     for (let i = 0; i < filteredToolAnnotations.length; i++) {
       const annotation = filteredToolAnnotations[i] as CrosshairsAnnotation;
@@ -897,6 +1392,18 @@ class CrosshairsTool extends AnnotationTool {
 
     const annotationUID = viewportAnnotation.annotationUID;
 
+    const viewportModality = this._getViewportModality(viewport);
+    if (
+      !viewportModality ||
+      !getWorldPointManager().isModalitySupported(viewportModality)
+    ) {
+      return renderStatus;
+    }
+
+    // A lone StackViewport (single subscriber for its FOR) has no other
+    // orientation planes to draw reference lines against — but we still fall
+    // through to render the center handle below.
+
     // Get cameras/canvases for each of these.
     // -- Get two world positions for this canvas in this line (e.g. the diagonal)
     // -- Convert these world positions to this canvas.
@@ -911,6 +1418,10 @@ class CrosshairsTool extends AnnotationTool {
     const data = viewportAnnotation.data;
     const crosshairCenterCanvas = viewport.worldToCanvas(this.toolCenter);
 
+    // Reference lines / rotation / slab-thickness handles are only meaningful
+    // between viewports with distinct orientation planes. This filter returns
+    // an empty array for a single-viewport FOR, in which case only the
+    // `centerHandle` circle (rendered further below) is drawn.
     const otherViewportAnnotations =
       this._filterAnnotationsByUniqueViewportOrientations(
         enabledElement,
@@ -919,181 +1430,169 @@ class CrosshairsTool extends AnnotationTool {
 
     const referenceLines = [];
 
+    // 3D viewports have no fixed orientation plane, so reference lines
+    // are not meaningful — only the center handle/point should be drawn.
+    const isCurrentViewport3D = viewport instanceof VolumeViewport3D;
+
     // get canvas information for points and lines (canvas box, canvas horizontal distances)
     const canvasBox = [0, 0, clientWidth, clientHeight];
 
-    otherViewportAnnotations.forEach((annotation) => {
-      const { data } = annotation;
+    if (!isCurrentViewport3D) {
+      otherViewportAnnotations.forEach((annotation) => {
+        const { data } = annotation;
 
-      data.handles.toolCenter = this.toolCenter;
+        data.handles.toolCenter = this.toolCenter;
 
-      const otherViewport = renderingEngine.getViewport(
-        data.viewportId
-      ) as Types.IVolumeViewport;
+        const otherViewport = renderingEngine.getViewport(
+          data.viewportId
+        ) as Types.IVolumeViewport;
 
-      const otherCamera = getViewportICamera(otherViewport);
+        // Reference lines / slab-thickness handles are only meaningful for
+        // volume viewports with orientation planes. Skip StackViewports (which
+        // have no slab API) and VolumeViewport3D (which has no fixed orientation
+        // plane) to avoid drawing spurious reference lines in 3D viewports.
+        if (
+          !otherViewport ||
+          otherViewport instanceof StackViewport ||
+          otherViewport instanceof VolumeViewport3D ||
+          typeof otherViewport.getSlabThickness !== 'function'
+        ) {
+          return;
+        }
 
-      const otherViewportControllable = this._getReferenceLineControllable(
-        otherViewport.id
-      );
-      const otherViewportDraggableRotatable =
-        this._getReferenceLineDraggableRotatable(otherViewport.id);
-      const otherViewportSlabThicknessControlsOn =
-        this._getReferenceLineSlabThicknessControlsOn(otherViewport.id);
+        const otherCamera = getViewportICamera(otherViewport);
 
-      // get coordinates for the reference line
-      const { clientWidth, clientHeight } =
-        getDisplayedCanvasSize(otherViewport);
-      const otherCanvasDiagonalLength = Math.sqrt(
-        clientWidth * clientWidth + clientHeight * clientHeight
-      );
-      const otherCanvasCenter: Types.Point2 = [
-        clientWidth * 0.5,
-        clientHeight * 0.5,
-      ];
-      const otherViewportCenterWorld =
-        otherViewport.canvasToWorld(otherCanvasCenter);
-
-      const direction: Types.Point3 = [0, 0, 0];
-      vtkMath.cross(
-        camera.viewPlaneNormal,
-        otherCamera.viewPlaneNormal,
-        direction
-      );
-      vtkMath.normalize(direction);
-      vtkMath.multiplyScalar(
-        <Types.Point3>direction,
-        otherCanvasDiagonalLength
-      );
-
-      const pointWorld0: Types.Point3 = [0, 0, 0];
-      vtkMath.add(otherViewportCenterWorld, direction, pointWorld0);
-
-      const pointWorld1: Types.Point3 = [0, 0, 0];
-      vtkMath.subtract(otherViewportCenterWorld, direction, pointWorld1);
-
-      const pointCanvas0 = viewport.worldToCanvas(pointWorld0);
-
-      const otherViewportCenterCanvas = viewport.worldToCanvas(
-        otherViewportCenterWorld
-      );
-
-      const canvasUnitVectorFromCenter = vec2.create();
-      vec2.subtract(
-        canvasUnitVectorFromCenter,
-        pointCanvas0,
-        otherViewportCenterCanvas
-      );
-      vec2.normalize(canvasUnitVectorFromCenter, canvasUnitVectorFromCenter);
-
-      // Graphic:
-      // Mid -> SlabThickness handle
-      // Short -> Rotation handle
-      //                           Long
-      //                            |
-      //                            |
-      //                            |
-      //                           Mid
-      //                            |
-      //                            |
-      //                            |
-      //                          Short
-      //                            |
-      //                            |
-      //                            |
-      // Long --- Mid--- Short--- Center --- Short --- Mid --- Long
-      //                            |
-      //                            |
-      //                            |
-      //                          Short
-      //                            |
-      //                            |
-      //                            |
-      //                           Mid
-      //                            |
-      //                            |
-      //                            |
-      //                           Long
-      const canvasVectorFromCenterLong = vec2.create();
-
-      vec2.scale(
-        canvasVectorFromCenterLong,
-        canvasUnitVectorFromCenter,
-        canvasDiagonalLength * 100
-      );
-      const canvasVectorFromCenterShort = vec2.create();
-      vec2.scale(
-        canvasVectorFromCenterShort,
-        canvasUnitVectorFromCenter,
-        // Chosen 0.2 because is half of 0.4.
-        canvasMinDimensionLength * 0.2
-      );
-      const canvasVectorFromCenterStart = vec2.create();
-      // Calculate center gap using ratio if provided, else fallback to pixel value
-      const mobileConfig = this.configuration.mobile;
-      const activeConfiguration = mobileConfig?.enabled
-        ? mobileConfig
-        : this.configuration;
-      const { referenceLinesCenterGapRatio } = activeConfiguration;
-      const minimalCrosshairConfig = getMinimalCrosshairConfig(
-        this.configuration
-      );
-
-      const centerGap =
-        referenceLinesCenterGapRatio > 0
-          ? canvasMinDimensionLength * referenceLinesCenterGapRatio
-          : this.configuration.referenceLinesCenterGapRadius;
-
-      vec2.scale(
-        canvasVectorFromCenterStart,
-        canvasUnitVectorFromCenter,
-        // Don't put a gap if the the third view is missing
-        otherViewportAnnotations.length === 2 ? centerGap : 0
-      );
-
-      // Computing Reference start and end (4 lines per viewport in case of 3 view MPR)
-      const refLinePointOne = vec2.create();
-      const refLinePointTwo = vec2.create();
-      const refLinePointThree = vec2.create();
-      const refLinePointFour = vec2.create();
-
-      let refLinesCenter = vec2.clone(crosshairCenterCanvas);
-      if (!otherViewportDraggableRotatable || !otherViewportControllable) {
-        refLinesCenter = vec2.clone(otherViewportCenterCanvas);
-      }
-
-      vec2.add(refLinePointOne, refLinesCenter, canvasVectorFromCenterStart);
-      vec2.add(refLinePointTwo, refLinesCenter, canvasVectorFromCenterLong);
-      vec2.subtract(
-        refLinePointThree,
-        refLinesCenter,
-        canvasVectorFromCenterStart
-      );
-      vec2.subtract(
-        refLinePointFour,
-        refLinesCenter,
-        canvasVectorFromCenterLong
-      );
-
-      // Clipping lines to be only included in a box (canvas), we don't want
-      // the lines goes beyond canvas
-      liangBarksyClip(refLinePointOne, refLinePointTwo, canvasBox);
-      liangBarksyClip(refLinePointThree, refLinePointFour, canvasBox);
-
-      if (minimalCrosshairConfig.enabled) {
-        const minimalCanvasVectorFromCenterLong = vec2.create();
-        vec2.scale(
-          minimalCanvasVectorFromCenterLong,
-          canvasUnitVectorFromCenter,
-          minimalCrosshairConfig.lineLengthInPx
+        const otherViewportControllable = this._getReferenceLineControllable(
+          otherViewport.id
         );
+        const otherViewportDraggableRotatable =
+          this._getReferenceLineDraggableRotatable(otherViewport.id);
+        const otherViewportSlabThicknessControlsOn =
+          this._getReferenceLineSlabThicknessControlsOn(otherViewport.id);
+
+        // get coordinates for the reference line
+        const { clientWidth, clientHeight } =
+          getDisplayedCanvasSize(otherViewport);
+        const otherCanvasDiagonalLength = Math.sqrt(
+          clientWidth * clientWidth + clientHeight * clientHeight
+        );
+        const otherCanvasCenter: Types.Point2 = [
+          clientWidth * 0.5,
+          clientHeight * 0.5,
+        ];
+        const otherViewportCenterWorld =
+          otherViewport.canvasToWorld(otherCanvasCenter);
+
+        const direction: Types.Point3 = [0, 0, 0];
+        vtkMath.cross(
+          camera.viewPlaneNormal,
+          otherCamera.viewPlaneNormal,
+          direction
+        );
+        vtkMath.normalize(direction);
+        vtkMath.multiplyScalar(
+          <Types.Point3>direction,
+          otherCanvasDiagonalLength
+        );
+
+        const pointWorld0: Types.Point3 = [0, 0, 0];
+        vtkMath.add(otherViewportCenterWorld, direction, pointWorld0);
+
+        const pointWorld1: Types.Point3 = [0, 0, 0];
+        vtkMath.subtract(otherViewportCenterWorld, direction, pointWorld1);
+
+        const pointCanvas0 = viewport.worldToCanvas(pointWorld0);
+
+        const otherViewportCenterCanvas = viewport.worldToCanvas(
+          otherViewportCenterWorld
+        );
+
+        const canvasUnitVectorFromCenter = vec2.create();
+        vec2.subtract(
+          canvasUnitVectorFromCenter,
+          pointCanvas0,
+          otherViewportCenterCanvas
+        );
+        vec2.normalize(canvasUnitVectorFromCenter, canvasUnitVectorFromCenter);
+
+        // Graphic:
+        // Mid -> SlabThickness handle
+        // Short -> Rotation handle
+        //                           Long
+        //                            |
+        //                            |
+        //                            |
+        //                           Mid
+        //                            |
+        //                            |
+        //                            |
+        //                          Short
+        //                            |
+        //                            |
+        //                            |
+        // Long --- Mid--- Short--- Center --- Short --- Mid --- Long
+        //                            |
+        //                            |
+        //                            |
+        //                          Short
+        //                            |
+        //                            |
+        //                            |
+        //                           Mid
+        //                            |
+        //                            |
+        //                            |
+        //                           Long
+        const canvasVectorFromCenterLong = vec2.create();
+
+        vec2.scale(
+          canvasVectorFromCenterLong,
+          canvasUnitVectorFromCenter,
+          canvasDiagonalLength * 100
+        );
+        const canvasVectorFromCenterShort = vec2.create();
+        vec2.scale(
+          canvasVectorFromCenterShort,
+          canvasUnitVectorFromCenter,
+          // Chosen 0.2 because is half of 0.4.
+          canvasMinDimensionLength * 0.2
+        );
+        const canvasVectorFromCenterStart = vec2.create();
+        // Calculate center gap using ratio if provided, else fallback to pixel value
+        const mobileConfig = this.configuration.mobile;
+        const activeConfiguration = mobileConfig?.enabled
+          ? mobileConfig
+          : this.configuration;
+        const { referenceLinesCenterGapRatio } = activeConfiguration;
+        const minimalCrosshairConfig = getMinimalCrosshairConfig(
+          this.configuration
+        );
+
+        const centerGap =
+          referenceLinesCenterGapRatio > 0
+            ? canvasMinDimensionLength * referenceLinesCenterGapRatio
+            : this.configuration.referenceLinesCenterGapRadius;
+
+        vec2.scale(
+          canvasVectorFromCenterStart,
+          canvasUnitVectorFromCenter,
+          // Don't put a gap if the the third view is missing
+          otherViewportAnnotations.length === 2 ? centerGap : 0
+        );
+
+        // Computing Reference start and end (4 lines per viewport in case of 3 view MPR)
+        const refLinePointOne = vec2.create();
+        const refLinePointTwo = vec2.create();
+        const refLinePointThree = vec2.create();
+        const refLinePointFour = vec2.create();
+
+        let refLinesCenter = vec2.clone(crosshairCenterCanvas);
+        if (!otherViewportDraggableRotatable || !otherViewportControllable) {
+          refLinesCenter = vec2.clone(otherViewportCenterCanvas);
+        }
 
         vec2.add(refLinePointOne, refLinesCenter, canvasVectorFromCenterStart);
-        vec2.add(
-          refLinePointTwo,
-          refLinePointOne,
-          minimalCanvasVectorFromCenterLong
-        );
+        vec2.add(refLinePointTwo, refLinesCenter, canvasVectorFromCenterLong);
         vec2.subtract(
           refLinePointThree,
           refLinesCenter,
@@ -1101,174 +1600,220 @@ class CrosshairsTool extends AnnotationTool {
         );
         vec2.subtract(
           refLinePointFour,
-          refLinePointThree,
-          minimalCanvasVectorFromCenterLong
+          refLinesCenter,
+          canvasVectorFromCenterLong
         );
 
+        // Clipping lines to be only included in a box (canvas), we don't want
+        // the lines goes beyond canvas
         liangBarksyClip(refLinePointOne, refLinePointTwo, canvasBox);
         liangBarksyClip(refLinePointThree, refLinePointFour, canvasBox);
-      }
 
-      // Computing rotation handle positions
-      const rotHandleOne = getSegmentMidpoint(refLinePointOne, refLinePointTwo);
-      const rotHandleTwo = getSegmentMidpoint(
-        refLinePointThree,
-        refLinePointFour
-      );
+        if (minimalCrosshairConfig.enabled) {
+          const minimalCanvasVectorFromCenterLong = vec2.create();
+          vec2.scale(
+            minimalCanvasVectorFromCenterLong,
+            canvasUnitVectorFromCenter,
+            minimalCrosshairConfig.lineLengthInPx
+          );
 
-      // Computing SlabThickness (st below) position
+          vec2.add(
+            refLinePointOne,
+            refLinesCenter,
+            canvasVectorFromCenterStart
+          );
+          vec2.add(
+            refLinePointTwo,
+            refLinePointOne,
+            minimalCanvasVectorFromCenterLong
+          );
+          vec2.subtract(
+            refLinePointThree,
+            refLinesCenter,
+            canvasVectorFromCenterStart
+          );
+          vec2.subtract(
+            refLinePointFour,
+            refLinePointThree,
+            minimalCanvasVectorFromCenterLong
+          );
 
-      // SlabThickness center in canvas
-      let stHandlesCenterCanvas = vec2.clone(crosshairCenterCanvas);
-      if (
-        !otherViewportDraggableRotatable &&
-        otherViewportSlabThicknessControlsOn
-      ) {
-        stHandlesCenterCanvas = vec2.clone(otherViewportCenterCanvas);
-      }
+          liangBarksyClip(refLinePointOne, refLinePointTwo, canvasBox);
+          liangBarksyClip(refLinePointThree, refLinePointFour, canvasBox);
+        }
 
-      // SlabThickness center in world
-      let stHandlesCenterWorld: Types.Point3 = [...this.toolCenter];
-      if (
-        !otherViewportDraggableRotatable &&
-        otherViewportSlabThicknessControlsOn
-      ) {
-        stHandlesCenterWorld = [...otherViewportCenterWorld];
-      }
+        // Computing rotation handle positions
+        const rotHandleOne = getSegmentMidpoint(
+          refLinePointOne,
+          refLinePointTwo
+        );
+        const rotHandleTwo = getSegmentMidpoint(
+          refLinePointThree,
+          refLinePointFour
+        );
 
-      const worldUnitVectorFromCenter: Types.Point3 = [0, 0, 0];
-      vtkMath.subtract(pointWorld0, pointWorld1, worldUnitVectorFromCenter);
-      vtkMath.normalize(worldUnitVectorFromCenter);
+        // Computing SlabThickness (st below) position
 
-      const { viewPlaneNormal } = camera;
-      // @ts-ignore // Todo: fix after vtk pr merged
-      const { matrix } = vtkMatrixBuilder
-        .buildFromDegree()
-        // @ts-ignore fix after vtk pr merged
-        .rotate(90, viewPlaneNormal);
+        // SlabThickness center in canvas
+        let stHandlesCenterCanvas = vec2.clone(crosshairCenterCanvas);
+        if (
+          !otherViewportDraggableRotatable &&
+          otherViewportSlabThicknessControlsOn
+        ) {
+          stHandlesCenterCanvas = vec2.clone(otherViewportCenterCanvas);
+        }
 
-      const worldUnitOrthoVectorFromCenter: Types.Point3 = [0, 0, 0];
-      vec3.transformMat4(
-        worldUnitOrthoVectorFromCenter,
-        worldUnitVectorFromCenter,
-        matrix
-      );
+        // SlabThickness center in world
+        let stHandlesCenterWorld: Types.Point3 = [...this.toolCenter];
+        if (
+          !otherViewportDraggableRotatable &&
+          otherViewportSlabThicknessControlsOn
+        ) {
+          stHandlesCenterWorld = [...otherViewportCenterWorld];
+        }
 
-      const slabThicknessValue = getSlabThicknessOrDefault(otherViewport);
-      const worldOrthoVectorFromCenter: Types.Point3 = [
-        ...worldUnitOrthoVectorFromCenter,
-      ];
-      vtkMath.multiplyScalar(worldOrthoVectorFromCenter, slabThicknessValue);
+        const worldUnitVectorFromCenter: Types.Point3 = [0, 0, 0];
+        vtkMath.subtract(pointWorld0, pointWorld1, worldUnitVectorFromCenter);
+        vtkMath.normalize(worldUnitVectorFromCenter);
 
-      const worldVerticalRefPoint: Types.Point3 = [0, 0, 0];
-      vtkMath.add(
-        stHandlesCenterWorld,
-        worldOrthoVectorFromCenter,
-        worldVerticalRefPoint
-      );
+        const { viewPlaneNormal } = camera;
+        // @ts-ignore // Todo: fix after vtk pr merged
+        const { matrix } = vtkMatrixBuilder
+          .buildFromDegree()
+          // @ts-ignore fix after vtk pr merged
+          .rotate(90, viewPlaneNormal);
 
-      // convert vertical world distances in canvas coordinates
-      const canvasVerticalRefPoint = viewport.worldToCanvas(
-        worldVerticalRefPoint
-      );
+        const worldUnitOrthoVectorFromCenter: Types.Point3 = [0, 0, 0];
+        vec3.transformMat4(
+          worldUnitOrthoVectorFromCenter,
+          worldUnitVectorFromCenter,
+          matrix
+        );
 
-      // points for slab thickness lines
-      const canvasOrthoVectorFromCenter = vec2.create();
-      vec2.subtract(
-        canvasOrthoVectorFromCenter,
-        stHandlesCenterCanvas,
-        canvasVerticalRefPoint
-      );
+        const slabThicknessValue = getSlabThicknessOrDefault(otherViewport);
+        const worldOrthoVectorFromCenter: Types.Point3 = [
+          ...worldUnitOrthoVectorFromCenter,
+        ];
+        vtkMath.multiplyScalar(worldOrthoVectorFromCenter, slabThicknessValue);
 
-      const stLinePointOne = vec2.create();
-      vec2.subtract(
-        stLinePointOne,
-        stHandlesCenterCanvas,
-        canvasVectorFromCenterLong
-      );
-      vec2.add(stLinePointOne, stLinePointOne, canvasOrthoVectorFromCenter);
+        const worldVerticalRefPoint: Types.Point3 = [0, 0, 0];
+        vtkMath.add(
+          stHandlesCenterWorld,
+          worldOrthoVectorFromCenter,
+          worldVerticalRefPoint
+        );
 
-      const stLinePointTwo = vec2.create();
-      vec2.add(
-        stLinePointTwo,
-        stHandlesCenterCanvas,
-        canvasVectorFromCenterLong
-      );
-      vec2.add(stLinePointTwo, stLinePointTwo, canvasOrthoVectorFromCenter);
+        // convert vertical world distances in canvas coordinates
+        const canvasVerticalRefPoint = viewport.worldToCanvas(
+          worldVerticalRefPoint
+        );
 
-      liangBarksyClip(stLinePointOne, stLinePointTwo, canvasBox);
+        // points for slab thickness lines
+        const canvasOrthoVectorFromCenter = vec2.create();
+        vec2.subtract(
+          canvasOrthoVectorFromCenter,
+          stHandlesCenterCanvas,
+          canvasVerticalRefPoint
+        );
 
-      const stLinePointThree = vec2.create();
-      vec2.add(
-        stLinePointThree,
-        stHandlesCenterCanvas,
-        canvasVectorFromCenterLong
-      );
-      vec2.subtract(
-        stLinePointThree,
-        stLinePointThree,
-        canvasOrthoVectorFromCenter
-      );
+        const stLinePointOne = vec2.create();
+        vec2.subtract(
+          stLinePointOne,
+          stHandlesCenterCanvas,
+          canvasVectorFromCenterLong
+        );
+        vec2.add(stLinePointOne, stLinePointOne, canvasOrthoVectorFromCenter);
 
-      const stLinePointFour = vec2.create();
-      vec2.subtract(
-        stLinePointFour,
-        stHandlesCenterCanvas,
-        canvasVectorFromCenterLong
-      );
-      vec2.subtract(
-        stLinePointFour,
-        stLinePointFour,
-        canvasOrthoVectorFromCenter
-      );
+        const stLinePointTwo = vec2.create();
+        vec2.add(
+          stLinePointTwo,
+          stHandlesCenterCanvas,
+          canvasVectorFromCenterLong
+        );
+        vec2.add(stLinePointTwo, stLinePointTwo, canvasOrthoVectorFromCenter);
 
-      liangBarksyClip(stLinePointThree, stLinePointFour, canvasBox);
+        liangBarksyClip(stLinePointOne, stLinePointTwo, canvasBox);
 
-      // points for slab thickness handles
-      const stHandleOne = vec2.create();
-      const stHandleTwo = vec2.create();
-      const stHandleThree = vec2.create();
-      const stHandleFour = vec2.create();
+        const stLinePointThree = vec2.create();
+        vec2.add(
+          stLinePointThree,
+          stHandlesCenterCanvas,
+          canvasVectorFromCenterLong
+        );
+        vec2.subtract(
+          stLinePointThree,
+          stLinePointThree,
+          canvasOrthoVectorFromCenter
+        );
 
-      vec2.subtract(
-        stHandleOne,
-        stHandlesCenterCanvas,
-        canvasVectorFromCenterShort
-      );
-      vec2.add(stHandleOne, stHandleOne, canvasOrthoVectorFromCenter);
-      vec2.add(stHandleTwo, stHandlesCenterCanvas, canvasVectorFromCenterShort);
-      vec2.add(stHandleTwo, stHandleTwo, canvasOrthoVectorFromCenter);
-      vec2.subtract(
-        stHandleThree,
-        stHandlesCenterCanvas,
-        canvasVectorFromCenterShort
-      );
-      vec2.subtract(stHandleThree, stHandleThree, canvasOrthoVectorFromCenter);
-      vec2.add(
-        stHandleFour,
-        stHandlesCenterCanvas,
-        canvasVectorFromCenterShort
-      );
-      vec2.subtract(stHandleFour, stHandleFour, canvasOrthoVectorFromCenter);
+        const stLinePointFour = vec2.create();
+        vec2.subtract(
+          stLinePointFour,
+          stHandlesCenterCanvas,
+          canvasVectorFromCenterLong
+        );
+        vec2.subtract(
+          stLinePointFour,
+          stLinePointFour,
+          canvasOrthoVectorFromCenter
+        );
 
-      referenceLines.push([
-        otherViewport,
-        refLinePointOne,
-        refLinePointTwo,
-        refLinePointThree,
-        refLinePointFour,
-        stLinePointOne,
-        stLinePointTwo,
-        stLinePointThree,
-        stLinePointFour,
-        rotHandleOne,
-        rotHandleTwo,
-        stHandleOne,
-        stHandleTwo,
-        stHandleThree,
-        stHandleFour,
-      ]);
-    });
+        liangBarksyClip(stLinePointThree, stLinePointFour, canvasBox);
+
+        // points for slab thickness handles
+        const stHandleOne = vec2.create();
+        const stHandleTwo = vec2.create();
+        const stHandleThree = vec2.create();
+        const stHandleFour = vec2.create();
+
+        vec2.subtract(
+          stHandleOne,
+          stHandlesCenterCanvas,
+          canvasVectorFromCenterShort
+        );
+        vec2.add(stHandleOne, stHandleOne, canvasOrthoVectorFromCenter);
+        vec2.add(
+          stHandleTwo,
+          stHandlesCenterCanvas,
+          canvasVectorFromCenterShort
+        );
+        vec2.add(stHandleTwo, stHandleTwo, canvasOrthoVectorFromCenter);
+        vec2.subtract(
+          stHandleThree,
+          stHandlesCenterCanvas,
+          canvasVectorFromCenterShort
+        );
+        vec2.subtract(
+          stHandleThree,
+          stHandleThree,
+          canvasOrthoVectorFromCenter
+        );
+        vec2.add(
+          stHandleFour,
+          stHandlesCenterCanvas,
+          canvasVectorFromCenterShort
+        );
+        vec2.subtract(stHandleFour, stHandleFour, canvasOrthoVectorFromCenter);
+
+        referenceLines.push([
+          otherViewport,
+          refLinePointOne,
+          refLinePointTwo,
+          refLinePointThree,
+          refLinePointFour,
+          stLinePointOne,
+          stLinePointTwo,
+          stLinePointThree,
+          stLinePointFour,
+          rotHandleOne,
+          rotHandleTwo,
+          stHandleOne,
+          stHandleTwo,
+          stHandleThree,
+          stHandleFour,
+        ]);
+      });
+    } // end if (!isCurrentViewport3D)
 
     const newRtpoints = [];
     const newStpoints = [];
@@ -1568,7 +2113,7 @@ class CrosshairsTool extends AnnotationTool {
             line[8],
             {
               color,
-              width: line,
+              width: 1,
               lineDash: [2, 3],
             }
           );
@@ -1631,6 +2176,32 @@ class CrosshairsTool extends AnnotationTool {
       );
     }
 
+    if (this.configuration.centerHandle?.enabled) {
+      const centerHandleConfig = this.configuration.centerHandle;
+      const centerHandleColor = centerHandleConfig.color || color;
+      const centerHandleRadius =
+        centerHandleConfig.radius ?? this.configuration.handleRadius ?? 3;
+
+      const isCenterHandleActive =
+        data.handles.activeOperation === OPERATION.DRAG &&
+        data.activeViewportIds?.length > 0;
+
+      drawCircleSvg(
+        svgDrawingHelper,
+        annotationUID,
+        'centerHandle',
+        crosshairCenterCanvas as Types.Point2,
+        centerHandleRadius,
+        {
+          color: centerHandleColor,
+          fill: isCenterHandleActive ? centerHandleColor : 'rgba(0, 0, 0, 0)',
+          fillOpacity: isCenterHandleActive ? 0.6 : 0,
+          strokeOpacity:
+            viewportAnnotation.highlighted || isCenterHandleActive ? 1 : 0.8,
+        }
+      );
+    }
+
     return renderStatus;
   };
 
@@ -1653,29 +2224,25 @@ class CrosshairsTool extends AnnotationTool {
 
   _onNewVolume = (_evt?: Event) => {
     this._syncVolumeListenersWithToolGroup();
+
+    const forUID = this._getOwnFrameOfReferenceUID();
+    const manager = getWorldPointManager();
+    const sharedCenter = forUID ? manager.getPoint(forUID) : null;
+    if (sharedCenter) {
+      this.setToolCenter(sharedCenter, true);
+      return;
+    }
+
+    if (this._lastValidToolCenter) {
+      this.setToolCenter(this._lastValidToolCenter, false);
+      return;
+    }
+
     this._recomputeToolCenterFromAbsoluteCameras({
       emitEvent: true,
       updateViewportCameras: false,
     });
   };
-
-  /**
-   * @deprecated No longer manages per-viewport listeners directly.
-   * Listener lifecycle is now handled by _syncVolumeListenersWithToolGroup.
-   * Will be removed in a future version.
-   */
-  _unsubscribeToViewportNewVolumeSet(_viewportsInfo) {
-    this._syncVolumeListenersWithToolGroup();
-  }
-
-  /**
-   * @deprecated No longer manages per-viewport listeners directly.
-   * Listener lifecycle is now handled by _syncVolumeListenersWithToolGroup.
-   * Will be removed in a future version.
-   */
-  _subscribeToViewportNewVolumeSet(_viewports) {
-    this._syncVolumeListenersWithToolGroup();
-  }
 
   _autoPanViewportIfNecessary(
     viewportId: string,
@@ -1685,9 +2252,8 @@ class CrosshairsTool extends AnnotationTool {
     // 2. If it is outside, pan the viewport to fit in the toolCenter
 
     const viewport = renderingEngine.getViewport(viewportId);
-    // Auto-pan is an in-plane world-space focal-point shift (setCamera), which native
-    // PLANAR_NEXT cannot express (setViewReference snaps to slice). Skip on native;
-    // it is a comfort feature, not correctness. TODO(next): port via setViewState anchorWorld.
+    // Auto-pan is an in-plane focal-point shift (setCamera) that native
+    // PLANAR_NEXT can't express; skip on native (comfort feature only).
     if (csUtils.isGenericViewport(viewport)) {
       return;
     }
@@ -2065,9 +2631,8 @@ class CrosshairsTool extends AnnotationTool {
   };
 
   _checkIfViewportsRenderingSameScene = (viewport, otherViewport) => {
-    // Native PLANAR_NEXT has no getAllVolumeIds; two native viewports render the same
-    // scene when they are bound to the same dataset (view-reference dataId), which is
-    // the MPR case (axial/sagittal/coronal of one volume share a dataId).
+    // Native PLANAR_NEXT has no getAllVolumeIds; compare view-reference dataId
+    // instead (MPR planes of one volume share a dataId).
     if (
       csUtils.isGenericViewport(viewport) ||
       csUtils.isGenericViewport(otherViewport)
@@ -2133,12 +2698,23 @@ class CrosshairsTool extends AnnotationTool {
       viewportsAnnotationsToUpdate,
       delta
     );
-    this._recomputeToolCenterFromAbsoluteCameras({
-      emitEvent: true,
-      updateViewportCameras: false,
+
+    const forUID = this._getOwnFrameOfReferenceUID();
+    const manager = getWorldPointManager();
+    if (forUID) {
+      manager.setPoint(forUID, jumpWorld, viewport.id, renderingEngine.id);
+    }
+    this._commitToolCenter(jumpWorld, {
+      senderViewportId: viewport.id,
+      senderRenderingEngineId: renderingEngine.id,
     });
 
-    // Render the source viewport so its crosshair lines update to the new tool center.
+    triggerEvent(eventTarget, Events.CROSSHAIR_TOOL_CENTER_CHANGED, {
+      toolGroupId: this.toolGroupId,
+      toolCenter: forUID ? (manager.getPoint(forUID) ?? jumpWorld) : jumpWorld,
+      FrameOfReferenceUID: forUID,
+    });
+
     viewport.render();
 
     state.isInteractingWithTool = false;
@@ -2187,16 +2763,39 @@ class CrosshairsTool extends AnnotationTool {
     const eventDetail = evt.detail;
     const { element } = eventDetail;
 
+    // Capture the operation type BEFORE it is cleared below — we need it to
+    // decide whether a post-interaction camera-plane recompute is allowed.
+    const lastOperation =
+      this.editData?.annotation?.data?.handles?.activeOperation;
+    const wasDragOperation = lastOperation === OPERATION.DRAG;
+
     if (this.editData?.annotation?.data) {
       this.editData.annotation.data.handles.activeOperation = null;
       this.editData.annotation.data.activeViewportIds = [];
     }
 
     this._deactivateModify(element);
-    this._recomputeToolCenterFromAbsoluteCameras({
-      emitEvent: true,
-      updateViewportCameras: false,
-    });
+
+    // Snap any StackViewport(s) to the slice closest to the final tool center
+    // only now that the drag has ended (during the drag the marker moves
+    // smoothly on canvas without switching slices — see `_dragCallback` — to
+    // avoid a slice-change/recompute feedback loop).
+    const forUID = this._getOwnFrameOfReferenceUID();
+    const manager = getWorldPointManager();
+    const point = forUID ? manager.getPoint(forUID) : null;
+    if (point) {
+      this._syncStackSlices(this._getViewportsInfo(), point);
+    }
+
+    // A DRAG only translates cameras (no orientation change), so toolCenter is
+    // already correct — recomputing from camera-plane intersection would make
+    // it snap/drift on release. Only recompute after ROTATE/SLAB.
+    if (!wasDragOperation) {
+      this._recomputeToolCenterFromAbsoluteCameras({
+        emitEvent: true,
+        updateViewportCameras: false,
+      });
+    }
 
     resetElementCursor(element);
 
@@ -2244,8 +2843,57 @@ class CrosshairsTool extends AnnotationTool {
     const canvasCoords = currentPoints.canvas;
 
     if (handles.activeOperation === OPERATION.DRAG) {
-      // TRANSLATION
-      // get the annotation of the other viewport which are parallel to the delta shift and are of the same scene
+      const forUID = this._getOwnFrameOfReferenceUID();
+      const manager = getWorldPointManager();
+
+      // For a StackViewport, snap the point directly to
+      // canvasToWorld(currentCanvas) instead of accumulating an in-plane delta
+      // (which drifts off the slice plane over time). Guarantees 1:1 mouse
+      // tracking on the physical slice plane.
+      const isStackSource = viewport instanceof StackViewport;
+
+      // World-space movement of this drag step, used to scroll the other MPR
+      // reference planes. Raw `delta` for an MPR source; derived from the
+      // snapped point movement for a StackViewport.
+      let actualDelta: Types.Point3 = delta as Types.Point3;
+
+      let newToolCenter: Types.Point3;
+      if (isStackSource) {
+        const currentWorld = viewport.canvasToWorld(
+          currentPoints.canvas
+        ) as Types.Point3;
+
+        newToolCenter = [currentWorld[0], currentWorld[1], currentWorld[2]];
+
+        actualDelta = [
+          newToolCenter[0] - this.toolCenter[0],
+          newToolCenter[1] - this.toolCenter[1],
+          newToolCenter[2] - this.toolCenter[2],
+        ];
+
+        this._debugLog('_dragCallback:DRAG:stack-source', {
+          viewportId: viewport.id,
+          currentWorld: this._formatPoint3(currentWorld),
+          actualDelta: this._formatPoint3(actualDelta),
+          newToolCenter: this._formatPoint3(newToolCenter),
+        });
+      } else {
+        newToolCenter = [
+          this.toolCenter[0] + delta[0],
+          this.toolCenter[1] + delta[1],
+          this.toolCenter[2] + delta[2],
+        ];
+
+        this._debugLog('_dragCallback:DRAG:volume-source', {
+          viewportId: viewport.id,
+          delta: this._formatPoint3(delta as Types.Point3),
+          newToolCenter: this._formatPoint3(newToolCenter),
+        });
+      }
+
+      // Scroll the other MPR reformat planes along their normals so they
+      // follow the drag. StackViewports are NOT slice-switched here (that would
+      // cause a feedback loop); their slice snaps on drag end (_endCallback).
       const otherViewportAnnotations =
         this._getAnnotationsForViewportsWithDifferentCameras(
           enabledElement,
@@ -2263,6 +2911,7 @@ class CrosshairsTool extends AnnotationTool {
             this._getReferenceLineDraggableRotatable(otherViewport.id);
 
           return (
+            !(otherViewport instanceof StackViewport) &&
             otherViewportControllable === true &&
             otherViewportDraggableRotatable === true &&
             viewportAnnotation.data.activeViewportIds.find(
@@ -2272,21 +2921,33 @@ class CrosshairsTool extends AnnotationTool {
         }
       );
 
+      // Use the in-plane `actualDelta` (exact world movement in the slice
+      // plane) so MPR reference planes follow the mouse precisely. For MPR
+      // sources `actualDelta === delta`.
       this._applyDeltaShiftToSelectedViewportCameras(
         renderingEngine,
         viewportsAnnotationsToUpdate,
-        delta
+        actualDelta
       );
-      this._recomputeToolCenterFromAbsoluteCameras({
-        emitEvent: true,
-        updateViewportCameras: false,
+
+      // Update the shared point in the manager (source of truth). The manager
+      // notifies every *other* subscriber (excluding this sender viewport), so
+      // the cursor never gets snapped back to its original position.
+      this._commitToolCenter(newToolCenter, {
+        senderViewportId: viewport.id,
+        senderRenderingEngineId: renderingEngine.id,
+      });
+
+      triggerEvent(eventTarget, Events.CROSSHAIR_TOOL_CENTER_CHANGED, {
+        toolGroupId: this.toolGroupId,
+        toolCenter: forUID
+          ? (manager.getPoint(forUID) ?? newToolCenter)
+          : newToolCenter,
+        FrameOfReferenceUID: forUID,
       });
     } else if (handles.activeOperation === OPERATION.ROTATE) {
-      // ROTATION
-      // Native PLANAR_NEXT has no setCamera and no validated free-oblique orientation
-      // write, so crosshairs rotation cannot be applied; skip it on native (the rotate
-      // handles are inert rather than throwing). TODO(next): oblique reformat via a
-      // setViewReference orientation write once cornerstone supports it.
+      // ROTATION — skipped on native PLANAR_NEXT (no setCamera / oblique
+      // orientation write); the rotate handles are inert rather than throwing.
       if (csUtils.isGenericViewport(enabledElement.viewport)) {
         return;
       }
@@ -2399,9 +3060,7 @@ class CrosshairsTool extends AnnotationTool {
         updateViewportCameras: false,
       });
     } else if (handles.activeOperation === OPERATION.SLAB) {
-      // SLAB THICKNESS
-      // Native PLANAR_NEXT has no slab-thickness API (setSlabThickness/
-      // resetSlabThickness); skip the slab operation on native rather than throwing.
+      // SLAB THICKNESS — skipped on native PLANAR_NEXT (no slab-thickness API).
       if (csUtils.isGenericViewport(enabledElement.viewport)) {
         return;
       }
@@ -2596,8 +3255,7 @@ class CrosshairsTool extends AnnotationTool {
   };
 
   setSlabThickness(viewport, slabThickness) {
-    // Native PLANAR_NEXT has no slab API (setBlendMode/setSlabThickness). The SLAB
-    // drag operation is already gated off on native; guard here too for safety.
+    // Native PLANAR_NEXT has no slab API; guard here for safety.
     if (csUtils.isGenericViewport(viewport)) {
       return;
     }
@@ -2645,6 +3303,16 @@ class CrosshairsTool extends AnnotationTool {
     const { data } = annotation;
 
     const viewport = renderingEngine.getViewport(data.viewportId);
+
+    // 3D volume renders have no per-slice scroll concept; their free-orbit
+    // camera must not be shifted, only re-project the point on render.
+    if (
+      csUtils.isGenericViewport(viewport) ||
+      viewport instanceof VolumeViewport3D
+    ) {
+      return;
+    }
+
     const camera = getViewportICamera(viewport);
     const normal = camera.viewPlaneNormal;
 
@@ -2669,8 +3337,7 @@ class CrosshairsTool extends AnnotationTool {
       this._ignoreFiredEvents = true;
       try {
         if (csUtils.isGenericViewport(viewport)) {
-          // Pure along-normal scroll; native has no setCamera, so navigate by view
-          // reference (snaps to nearest slice).
+          // Native has no setCamera; navigate by view reference (snaps to slice).
           jumpToFocalPoint(viewport, newFocalPoint);
         } else {
           viewport.setCamera({
@@ -2842,12 +3509,83 @@ class CrosshairsTool extends AnnotationTool {
     return null;
   }
 
+  /**
+   * Returns the ids of every other controllable+draggable viewport in the
+   * toolGroup, to translate together when dragging the center handle.
+   */
+  _getAllDraggableOtherViewportIds = (currentViewportId: string): string[] => {
+    const viewportsInfo = this._getViewportsInfo();
+    const viewportIds = [];
+
+    viewportsInfo.forEach(({ viewportId }) => {
+      if (viewportId === currentViewportId) {
+        return;
+      }
+
+      if (
+        this._getReferenceLineControllable(viewportId) &&
+        this._getReferenceLineDraggableRotatable(viewportId)
+      ) {
+        viewportIds.push(viewportId);
+      }
+    });
+
+    return viewportIds;
+  };
+
+  /**
+   * If `canvasCoords` is near the center handle, marks the annotation for a
+   * translation (DRAG) of every other draggable viewport.
+   */
+  _getCenterHandleNearImagePoint(
+    viewport,
+    annotation: CrosshairsAnnotation,
+    canvasCoords: Types.Point2,
+    proximity: number
+  ): boolean {
+    const centerHandleConfig = this.configuration.centerHandle;
+    if (!centerHandleConfig?.enabled) {
+      return false;
+    }
+
+    const centerCanvas = viewport.worldToCanvas(this.toolCenter);
+    const centerHandleRadius =
+      centerHandleConfig.radius ?? this.configuration.handleRadius ?? 3;
+    const centerHandleProximity = Math.max(centerHandleRadius, proximity);
+
+    if (vec2.distance(canvasCoords, centerCanvas) > centerHandleProximity) {
+      return false;
+    }
+
+    const { data } = annotation;
+    data.handles.activeOperation = OPERATION.DRAG;
+    data.activeViewportIds = this._getAllDraggableOtherViewportIds(viewport.id);
+
+    this.editData = {
+      annotation,
+    };
+
+    return true;
+  }
+
   _pointNearTool(element, annotation, canvasCoords, proximity) {
     const minimalCrosshairConfig = getMinimalCrosshairConfig(
       this.configuration
     );
     const enabledElement = getEnabledElement(element);
     const { viewport } = enabledElement;
+
+    if (
+      this._getCenterHandleNearImagePoint(
+        viewport,
+        annotation,
+        canvasCoords,
+        proximity
+      )
+    ) {
+      return true;
+    }
+
     const { clientWidth, clientHeight } = getDisplayedCanvasSize(viewport);
     const canvasDiagonalLength = Math.sqrt(
       clientWidth * clientWidth + clientHeight * clientHeight
@@ -3020,8 +3758,334 @@ class CrosshairsTool extends AnnotationTool {
     return data.handles.activeOperation === OPERATION.DRAG ? true : false;
   }
 
+  _registerViewportWithManager = (
+    renderingEngineId: string,
+    viewportId: string
+  ): void => {
+    const enabledElement = getEnabledElementByIds(
+      viewportId,
+      renderingEngineId
+    );
+    if (!enabledElement) {
+      return;
+    }
+
+    const { FrameOfReferenceUID, viewport } = enabledElement;
+    if (!FrameOfReferenceUID) {
+      return;
+    }
+
+    const manager = getWorldPointManager();
+    const viewportType = viewport instanceof StackViewport ? 'stack' : 'volume';
+    const modality = this._getViewportModality(viewport);
+
+    const viewportFilter = this.configuration?.viewportFilter;
+    if (typeof viewportFilter === 'function') {
+      const imageId = this._getViewportImageId(viewport);
+      if (!viewportFilter({ viewportId, modality, imageId })) {
+        return;
+      }
+    }
+
+    manager.registerViewport(FrameOfReferenceUID, {
+      viewportId,
+      renderingEngineId,
+      viewportType,
+      modality,
+      onWorldPointChanged: (point: Types.Point3, senderViewportId?: string) => {
+        if (senderViewportId === viewportId) {
+          return;
+        }
+        this._onManagerPointChanged(
+          point,
+          viewportId,
+          renderingEngineId,
+          senderViewportId
+        );
+      },
+    });
+  };
+
+  _unregisterViewportFromManager = (
+    renderingEngineId: string,
+    viewportId: string
+  ): void => {
+    const enabledElement = getEnabledElementByIds(
+      viewportId,
+      renderingEngineId
+    );
+    const forUID =
+      enabledElement?.FrameOfReferenceUID || this._getOwnFrameOfReferenceUID();
+    if (forUID) {
+      const manager = getWorldPointManager();
+      manager.unregisterViewport(forUID, renderingEngineId, viewportId);
+    }
+  };
+
+  _onManagerPointChanged = (
+    point: Types.Point3,
+    targetViewportId: string,
+    targetRenderingEngineId: string,
+    senderViewportId?: string
+  ): void => {
+    // Ignore updates that originated from this very viewport.
+    if (senderViewportId && senderViewportId === targetViewportId) {
+      return;
+    }
+
+    this._localToolCenter = [...point] as Types.Point3;
+    if (this._isFinitePoint3(point) && !this._isNearZeroPoint3(point)) {
+      this._lastValidToolCenter = [...point] as Types.Point3;
+    }
+
+    const enabledElement = getEnabledElementByIds(
+      targetViewportId,
+      targetRenderingEngineId
+    );
+    if (!enabledElement) {
+      triggerAnnotationRenderForViewportIds([targetViewportId]);
+      return;
+    }
+    const { viewport } = enabledElement;
+
+    this._debugLog('_onManagerPointChanged', {
+      targetViewportId,
+      senderViewportId,
+      point: this._formatPoint3(point),
+      viewportType: viewport instanceof StackViewport ? 'stack' : 'volume',
+    });
+
+    const isCrosshairDragging =
+      this.editData?.annotation?.data?.handles?.activeOperation ===
+      OPERATION.DRAG;
+
+    if (viewport instanceof StackViewport) {
+      // StackViewports are excluded from direct camera shifts in _dragCallback,
+      // so they must receive updates via the manager even during a drag (enables
+      // live scroll across 2D planes). Feedback loop is guarded by
+      // _pendingProgrammaticSliceIndex.
+      this._syncStackSlices(
+        [
+          {
+            viewportId: targetViewportId,
+            renderingEngineId: targetRenderingEngineId,
+          },
+        ],
+        point
+      );
+    } else {
+      // MPR (Volume) viewports are already shifted directly by the drag source
+      // via _applyDeltaShiftToSelectedViewportCameras; applying the manager
+      // update again here would move them at double speed, so ignore it during a
+      // drag.
+      if (isCrosshairDragging) {
+        return;
+      }
+      this._scrollVolumeViewportToPoint(viewport, point);
+    }
+
+    triggerAnnotationRenderForViewportIds([targetViewportId]);
+  };
+
+  /**
+   * Scrolls a non-Stack viewport's camera along its view plane normal so the
+   * reformat plane passes through `worldPoint`, without panning in-plane.
+   * Wrapped in _ignoreFiredEvents so the emitted CAMERA_MODIFIED doesn't loop back.
+   */
+  _scrollVolumeViewportToPoint = (viewport, worldPoint: Types.Point3): void => {
+    const camera = getViewportICamera(viewport);
+    const { focalPoint, position, viewPlaneNormal } = camera;
+    if (!focalPoint || !position || !viewPlaneNormal) {
+      return;
+    }
+
+    const scroll =
+      (worldPoint[0] - focalPoint[0]) * viewPlaneNormal[0] +
+      (worldPoint[1] - focalPoint[1]) * viewPlaneNormal[1] +
+      (worldPoint[2] - focalPoint[2]) * viewPlaneNormal[2];
+
+    if (Math.abs(scroll) < 1e-3) {
+      return;
+    }
+
+    const newFocalPoint: Types.Point3 = [
+      focalPoint[0] + scroll * viewPlaneNormal[0],
+      focalPoint[1] + scroll * viewPlaneNormal[1],
+      focalPoint[2] + scroll * viewPlaneNormal[2],
+    ];
+    const newPosition: Types.Point3 = [
+      position[0] + scroll * viewPlaneNormal[0],
+      position[1] + scroll * viewPlaneNormal[1],
+      position[2] + scroll * viewPlaneNormal[2],
+    ];
+
+    const previousIgnoreFiredEvents = this._ignoreFiredEvents;
+    this._ignoreFiredEvents = true;
+    try {
+      if (csUtils.isGenericViewport(viewport)) {
+        jumpToFocalPoint(viewport, newFocalPoint);
+      } else {
+        viewport.setCamera({
+          focalPoint: newFocalPoint,
+          position: newPosition,
+        });
+      }
+      viewport.render();
+    } finally {
+      this._ignoreFiredEvents = previousIgnoreFiredEvents;
+    }
+
+    this._debugLog('_scrollVolumeViewportToPoint', {
+      viewportId: viewport.id,
+      scroll: scroll.toFixed(4),
+      newFocalPoint: this._formatPoint3(newFocalPoint),
+    });
+  };
+
+  _registerAllViewportsWithManager = (): void => {
+    const viewportsInfo = this._getViewportsInfo();
+    viewportsInfo.forEach(({ viewportId, renderingEngineId }) => {
+      this._registerViewportWithManager(renderingEngineId, viewportId);
+    });
+  };
+
+  _unregisterAllViewportsFromManager = (): void => {
+    const viewportsInfo = this._getViewportsInfo();
+    viewportsInfo.forEach(({ viewportId, renderingEngineId }) => {
+      this._unregisterViewportFromManager(renderingEngineId, viewportId);
+    });
+  };
+
   _toViewportKey = (renderingEngineId: string, viewportId: string): string => {
     return `${renderingEngineId}::${viewportId}`;
+  };
+
+  _getViewportModality = (viewport: unknown): string | undefined => {
+    try {
+      if (typeof csUtils.getViewportModality === 'function') {
+        const modality = csUtils.getViewportModality(viewport);
+        if (modality) {
+          return modality;
+        }
+      }
+    } catch {}
+    if (viewport?.modality) {
+      return viewport.modality;
+    }
+    return undefined;
+  };
+
+  _getViewportImageId = (viewport: unknown): string | undefined => {
+    try {
+      if (viewport instanceof StackViewport) {
+        const imageIds = viewport.getImageIds?.();
+        if (!imageIds?.length) return undefined;
+        return viewport.getCurrentImageId?.() ?? imageIds[0];
+      }
+      const imageIds = (viewport as { getImageIds?: () => string[] })?.getImageIds?.();
+      return imageIds?.[0];
+    } catch {}
+    return undefined;
+  };
+
+  _isDebugEnabled = (): boolean => {
+    return (
+      !!this.configuration?.debug ||
+      !!(globalThis as { __CROSSHAIRS_DEBUG__?: boolean }).__CROSSHAIRS_DEBUG__
+    );
+  };
+
+  _debugLog = (message: string, payload?: unknown): void => {
+    if (!this._isDebugEnabled()) {
+      return;
+    }
+
+    if (payload !== undefined) {
+      console.info(`[CrosshairsDebug:${this.toolGroupId}] ${message}`, payload);
+    } else {
+      console.info(`[CrosshairsDebug:${this.toolGroupId}] ${message}`);
+    }
+  };
+
+  _formatPoint3 = (point: Types.Point3 | null | undefined): string | null => {
+    if (!point || point.length !== 3) {
+      return null;
+    }
+
+    return point.map((v) => Number(v).toFixed(3)).join(',');
+  };
+
+  _getViewportsDebugInfo = (
+    viewportsInfo: { viewportId: string; renderingEngineId: string }[]
+  ): Array<{
+    viewportId: string;
+    renderingEngineId: string;
+    enabled: boolean;
+    frameOfReferenceUID?: string;
+    focalPoint?: string | null;
+    viewPlaneNormal?: string | null;
+  }> => {
+    return viewportsInfo.map(({ viewportId, renderingEngineId }) => {
+      const enabledElement = getEnabledElementByIds(
+        viewportId,
+        renderingEngineId
+      );
+      const viewport = enabledElement?.viewport;
+      const camera = viewport ? getViewportICamera(viewport) : null;
+
+      return {
+        viewportId,
+        renderingEngineId,
+        enabled: !!enabledElement,
+        frameOfReferenceUID: enabledElement?.FrameOfReferenceUID,
+        focalPoint: camera?.focalPoint
+          ? this._formatPoint3(camera.focalPoint as Types.Point3)
+          : null,
+        viewPlaneNormal: camera?.viewPlaneNormal
+          ? this._formatPoint3(camera.viewPlaneNormal as Types.Point3)
+          : null,
+      };
+    });
+  };
+
+  _isNearZeroPoint3 = (point: Types.Point3, epsilon = 1e-3): boolean => {
+    return (
+      Math.abs(point[0]) < epsilon &&
+      Math.abs(point[1]) < epsilon &&
+      Math.abs(point[2]) < epsilon
+    );
+  };
+
+  _commitToolCenter = (
+    point: Types.Point3,
+    {
+      senderViewportId,
+      senderRenderingEngineId,
+    }: {
+      senderViewportId?: string;
+      senderRenderingEngineId?: string;
+    } = {}
+  ): void => {
+    this._localToolCenter = [...point] as Types.Point3;
+
+    const forUID = this._getOwnFrameOfReferenceUID();
+    if (forUID) {
+      const manager = getWorldPointManager();
+      if (!manager.isInitialized(forUID)) {
+        manager.initializePoint(forUID, point);
+      } else {
+        manager.setPoint(
+          forUID,
+          point,
+          senderViewportId,
+          senderRenderingEngineId
+        );
+      }
+    }
+
+    if (this._isFinitePoint3(point) && !this._isNearZeroPoint3(point)) {
+      this._lastValidToolCenter = [...point] as Types.Point3;
+    }
   };
 
   _isFinitePoint3 = (point: Types.Point3): boolean => {
@@ -3043,8 +4107,13 @@ class CrosshairsTool extends AnnotationTool {
           return;
         }
 
+        const { viewportId, renderingEngineId } = evt.detail;
+        if (viewportId && renderingEngineId) {
+          this._registerViewportWithManager(renderingEngineId, viewportId);
+        }
+
         this._syncVolumeListenersWithToolGroup();
-        this._computeToolCenter(this._getViewportsInfo());
+        this._scheduleDebouncedRecompute();
       }) as EventListener;
       eventTarget.addEventListener(
         Events.TOOLGROUP_VIEWPORT_ADDED,
@@ -3058,15 +4127,87 @@ class CrosshairsTool extends AnnotationTool {
           return;
         }
 
+        const { viewportId, renderingEngineId } = evt.detail;
+        if (viewportId && renderingEngineId) {
+          this._unregisterViewportFromManager(renderingEngineId, viewportId);
+        }
+
         this._syncVolumeListenersWithToolGroup();
-        this._recomputeToolCenterFromAbsoluteCameras({
-          emitEvent: true,
-          updateViewportCameras: false,
-        });
+
+        // Re-initialize + re-render the remaining viewports; removing one
+        // (e.g. 2D -> 3D switch) can leave siblings' state stale otherwise.
+        this._computeToolCenter(this._getViewportsInfo());
       }) as EventListener;
       eventTarget.addEventListener(
         Events.TOOLGROUP_VIEWPORT_REMOVED,
         this._toolGroupViewportRemovedListener
+      );
+    }
+
+    if (!this._elementEnabledListener) {
+      // Safety net: TOOLGROUP_VIEWPORT_ADDED can fire before the element is
+      // actually enabled, so the initial render finds no enabled element.
+      // Re-trigger once the element becomes available.
+      this._elementEnabledListener = ((evt: CustomEvent) => {
+        const { viewportId, renderingEngineId } = evt.detail || {};
+        if (!viewportId) {
+          return;
+        }
+
+        const isOwnViewport = this._getViewportsInfo().some(
+          (info) =>
+            info.viewportId === viewportId &&
+            (!renderingEngineId || info.renderingEngineId === renderingEngineId)
+        );
+
+        if (!isOwnViewport) {
+          return;
+        }
+
+        triggerAnnotationRenderForViewportIds([viewportId]);
+      }) as EventListener;
+
+      eventTarget.addEventListener(
+        Enums.Events.ELEMENT_ENABLED,
+        this._elementEnabledListener
+      );
+    }
+
+    if (!this._imageRenderedListener) {
+      // Extra safety net: IMAGE_RENDERED fires on every actual paint, so
+      // re-requesting our annotation render for our own viewports is a
+      // reliable catch-all for viewports that had nothing to draw earlier.
+      this._imageRenderedListener = ((evt: CustomEvent) => {
+        const { viewportId, renderingEngineId } = evt.detail || {};
+        if (!viewportId || !renderingEngineId) {
+          return;
+        }
+
+        const isOwnViewport = this._getViewportsInfo().some(
+          (info) =>
+            info.viewportId === viewportId &&
+            info.renderingEngineId === renderingEngineId
+        );
+
+        if (!isOwnViewport) {
+          return;
+        }
+
+        // First real render for this viewport: re-run initializeViewport once,
+        // since its annotation may have been created before the
+        // FrameOfReferenceUID settled.
+        const key = this._toViewportKey(renderingEngineId, viewportId);
+        if (!this._seenStackViewports.has(key)) {
+          this._seenStackViewports.add(key);
+          this.initializeViewport({ viewportId, renderingEngineId });
+        }
+
+        triggerAnnotationRenderForViewportIds([viewportId]);
+      }) as EventListener;
+
+      eventTarget.addEventListener(
+        Enums.Events.IMAGE_RENDERED,
+        this._imageRenderedListener
       );
     }
   };
@@ -3086,6 +4227,22 @@ class CrosshairsTool extends AnnotationTool {
         this._toolGroupViewportRemovedListener
       );
       this._toolGroupViewportRemovedListener = null;
+    }
+
+    if (this._elementEnabledListener) {
+      eventTarget.removeEventListener(
+        Enums.Events.ELEMENT_ENABLED,
+        this._elementEnabledListener
+      );
+      this._elementEnabledListener = null;
+    }
+
+    if (this._imageRenderedListener) {
+      eventTarget.removeEventListener(
+        Enums.Events.IMAGE_RENDERED,
+        this._imageRenderedListener
+      );
+      this._imageRenderedListener = null;
     }
   };
 
@@ -3169,92 +4326,105 @@ class CrosshairsTool extends AnnotationTool {
     this._volumeViewportNewVolumeListeners.clear();
   };
 
-  _calculateToolCenterFromAbsoluteCameras = (): Types.Point3 | null => {
-    const viewportsInfo = this._getViewportsInfo();
-    const uniquePlanes: Array<{
-      normal: Types.Point3;
-      point: Types.Point3;
-    }> = [];
+  _updateToolCenterFromCameraDelta = (
+    viewport: Types.IVolumeViewport,
+    evt: Event
+  ): void => {
+    if (
+      !this._isFinitePoint3(this.toolCenter) ||
+      this._isNearZeroPoint3(this.toolCenter)
+    ) {
+      this._debugLog('_updateToolCenterFromCameraDelta:skip-uninitialized', {
+        toolCenter: this._formatPoint3(this.toolCenter),
+      });
+      return;
+    }
 
-    viewportsInfo.forEach((viewportInfo) => {
-      const enabledElement = getEnabledElementByIds(
-        viewportInfo.viewportId,
-        viewportInfo.renderingEngineId
-      );
+    const eventDetail = (evt as CustomEvent).detail;
+    if (!eventDetail?.previousCamera || !eventDetail?.camera) {
+      return;
+    }
 
-      if (!enabledElement) {
-        return;
-      }
+    const { previousCamera, camera } = eventDetail;
+    const oldFocalPoint = previousCamera.focalPoint as Types.Point3;
+    const newFocalPoint = camera.focalPoint as Types.Point3;
+    const viewPlaneNormal = camera.viewPlaneNormal as Types.Point3;
 
-      const camera = getViewportICamera(enabledElement.viewport);
+    if (!oldFocalPoint || !newFocalPoint || !viewPlaneNormal) {
+      return;
+    }
 
-      const normal = [...camera.viewPlaneNormal] as Types.Point3;
-      const point = [...camera.focalPoint] as Types.Point3;
+    const delta: Types.Point3 = [
+      newFocalPoint[0] - oldFocalPoint[0],
+      newFocalPoint[1] - oldFocalPoint[1],
+      newFocalPoint[2] - oldFocalPoint[2],
+    ];
 
-      if (!this._isFinitePoint3(normal) || !this._isFinitePoint3(point)) {
-        return;
-      }
+    const deltaLength = Math.sqrt(
+      delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]
+    );
 
-      vec3.normalize(normal, normal);
+    if (deltaLength < 1e-3) {
+      return;
+    }
 
-      const alreadyTracked = uniquePlanes.some(
-        (plane) =>
-          csUtils.isEqual(plane.normal, normal, 1e-3) ||
-          csUtils.isOpposite(plane.normal, normal, 1e-3)
-      );
+    if (deltaLength > 50) {
+      this._debugLog('_updateToolCenterFromCameraDelta:skip-large-delta', {
+        deltaLength,
+        delta: this._formatPoint3(delta),
+      });
+      return;
+    }
 
-      if (!alreadyTracked) {
-        uniquePlanes.push({ normal, point });
-      }
+    const dotProduct =
+      delta[0] * viewPlaneNormal[0] +
+      delta[1] * viewPlaneNormal[1] +
+      delta[2] * viewPlaneNormal[2];
+
+    if (Math.abs(dotProduct) < 1e-3) {
+      return;
+    }
+
+    const projectedDelta: Types.Point3 = [
+      dotProduct * viewPlaneNormal[0],
+      dotProduct * viewPlaneNormal[1],
+      dotProduct * viewPlaneNormal[2],
+    ];
+
+    const newToolCenter: Types.Point3 = [
+      this.toolCenter[0] + projectedDelta[0],
+      this.toolCenter[1] + projectedDelta[1],
+      this.toolCenter[2] + projectedDelta[2],
+    ];
+
+    this._debugLog('_updateToolCenterFromCameraDelta', {
+      oldFocalPoint: this._formatPoint3(oldFocalPoint),
+      newFocalPoint: this._formatPoint3(newFocalPoint),
+      delta: this._formatPoint3(delta),
+      projectedDelta: this._formatPoint3(projectedDelta),
+      oldToolCenter: this._formatPoint3(this.toolCenter),
+      newToolCenter: this._formatPoint3(newToolCenter),
     });
 
-    if (uniquePlanes.length < 2) {
-      return null;
+    // Commit via _commitToolCenter (which calls the manager internally).
+    // Passing the source viewport id prevents the manager from notifying it
+    // back (ping-pong), and _ignoreFiredEvents suppresses the CAMERA_MODIFIED
+    // cascade from the resulting setCamera calls (breaks recursion).
+    const renderingEngineId =
+      (viewport as { renderingEngineId?: string }).renderingEngineId ??
+      this._getViewportsInfo().find((info) => info.viewportId === viewport.id)
+        ?.renderingEngineId;
+
+    const previousIgnoreFiredEvents = this._ignoreFiredEvents;
+    this._ignoreFiredEvents = true;
+    try {
+      this._commitToolCenter(newToolCenter, {
+        senderViewportId: viewport.id,
+        senderRenderingEngineId: renderingEngineId,
+      });
+    } finally {
+      this._ignoreFiredEvents = previousIgnoreFiredEvents;
     }
-
-    const firstPlane = csUtils.planar.planeEquation(
-      uniquePlanes[0].normal,
-      uniquePlanes[0].point
-    );
-    const secondPlane = csUtils.planar.planeEquation(
-      uniquePlanes[1].normal,
-      uniquePlanes[1].point
-    );
-
-    let thirdPlane;
-    if (uniquePlanes.length >= 3) {
-      thirdPlane = csUtils.planar.planeEquation(
-        uniquePlanes[2].normal,
-        uniquePlanes[2].point
-      );
-    } else {
-      const thirdNormal = vec3.create() as Types.Point3;
-      vec3.cross(thirdNormal, uniquePlanes[0].normal, uniquePlanes[1].normal);
-
-      if (vec3.length(thirdNormal) < 1e-6) {
-        return null;
-      }
-
-      vec3.normalize(thirdNormal, thirdNormal);
-
-      const thirdPoint = this._isFinitePoint3(this.toolCenter)
-        ? ([...this.toolCenter] as Types.Point3)
-        : ([
-            (uniquePlanes[0].point[0] + uniquePlanes[1].point[0]) * 0.5,
-            (uniquePlanes[0].point[1] + uniquePlanes[1].point[1]) * 0.5,
-            (uniquePlanes[0].point[2] + uniquePlanes[1].point[2]) * 0.5,
-          ] as Types.Point3);
-
-      thirdPlane = csUtils.planar.planeEquation(thirdNormal, thirdPoint);
-    }
-
-    const center = csUtils.planar.threePlaneIntersection(
-      firstPlane,
-      secondPlane,
-      thirdPlane
-    ) as Types.Point3;
-
-    return this._isFinitePoint3(center) ? center : null;
   };
 
   _recomputeToolCenterFromAbsoluteCameras = ({
@@ -3264,26 +4434,112 @@ class CrosshairsTool extends AnnotationTool {
     emitEvent?: boolean;
     updateViewportCameras?: boolean;
   } = {}): Types.Point3 | null => {
-    const toolCenter = this._calculateToolCenterFromAbsoluteCameras();
+    const viewportsInfo = this._getViewportsInfo();
+    const forUID = this._getOwnFrameOfReferenceUID();
+    const manager = getWorldPointManager();
+
+    const planes: CameraPlane[] = [];
+    viewportsInfo.forEach((viewportInfo) => {
+      const enabledElement = getEnabledElementByIds(
+        viewportInfo.viewportId,
+        viewportInfo.renderingEngineId
+      );
+      if (!enabledElement) {
+        return;
+      }
+      const camera = getViewportICamera(enabledElement.viewport);
+      const normal = [...camera.viewPlaneNormal] as Types.Point3;
+      const point = [...camera.focalPoint] as Types.Point3;
+      if (
+        this._isFinitePoint3(normal) &&
+        this._isFinitePoint3(point) &&
+        !this._isNearZeroPoint3(point)
+      ) {
+        planes.push({ normal, point });
+      }
+    });
+
+    const referencePoint =
+      this._isFinitePoint3(this.toolCenter) &&
+      !this._isNearZeroPoint3(this.toolCenter)
+        ? ([...this.toolCenter] as Types.Point3)
+        : this._isFinitePoint3(this._lastValidToolCenter as Types.Point3) &&
+            !this._isNearZeroPoint3(this._lastValidToolCenter as Types.Point3)
+          ? ([...(this._lastValidToolCenter as Types.Point3)] as Types.Point3)
+          : null;
+
+    let toolCenter = forUID
+      ? manager.recomputeFromCameras(forUID, planes, referencePoint)
+      : null;
+
+    const currentCenterIsMeaningful =
+      this._isFinitePoint3(this.toolCenter) &&
+      !this._isNearZeroPoint3(this.toolCenter);
+    const lastValidCenterIsMeaningful =
+      this._isFinitePoint3(this._lastValidToolCenter as Types.Point3) &&
+      !this._isNearZeroPoint3(this._lastValidToolCenter as Types.Point3);
+
+    if (toolCenter && this._isNearZeroPoint3(toolCenter)) {
+      this._debugLog(
+        '_recomputeToolCenterFromAbsoluteCameras:calculated-near-zero',
+        {
+          calculatedToolCenter: this._formatPoint3(toolCenter),
+          currentCenter: this._formatPoint3(this.toolCenter),
+          lastValidToolCenter: this._formatPoint3(this._lastValidToolCenter),
+        }
+      );
+
+      if (currentCenterIsMeaningful) {
+        toolCenter = [...this.toolCenter] as Types.Point3;
+      } else if (lastValidCenterIsMeaningful) {
+        toolCenter = [
+          ...(this._lastValidToolCenter as Types.Point3),
+        ] as Types.Point3;
+      }
+    }
+
+    if (!toolCenter && this._lastValidToolCenter) {
+      toolCenter = [...this._lastValidToolCenter] as Types.Point3;
+    }
 
     if (!toolCenter) {
+      this._debugLog('_recomputeToolCenterFromAbsoluteCameras:skip:no-center');
       return null;
     }
 
     const hasChanged = !csUtils.isEqual(this.toolCenter, toolCenter, 1e-3);
     if (!hasChanged) {
+      this._debugLog('_recomputeToolCenterFromAbsoluteCameras:no-change', {
+        toolCenter: this._formatPoint3(toolCenter),
+      });
       return toolCenter;
     }
 
     if (updateViewportCameras) {
+      this._debugLog(
+        '_recomputeToolCenterFromAbsoluteCameras:apply-with-camera-update',
+        {
+          toolCenter: this._formatPoint3(toolCenter),
+          emitEvent,
+        }
+      );
       this.setToolCenter(toolCenter, !emitEvent);
     } else {
-      this.toolCenter = toolCenter;
+      this._debugLog(
+        '_recomputeToolCenterFromAbsoluteCameras:apply-state-only',
+        {
+          toolCenter: this._formatPoint3(toolCenter),
+          emitEvent,
+        }
+      );
+      this._commitToolCenter(toolCenter);
 
       if (emitEvent) {
+        const currentPoint = forUID ? manager.getPoint(forUID) : null;
         triggerEvent(eventTarget, Events.CROSSHAIR_TOOL_CENTER_CHANGED, {
           toolGroupId: this.toolGroupId,
-          toolCenter: this.toolCenter,
+          toolCenter: currentPoint ?? this.toolCenter,
+          FrameOfReferenceUID: forUID,
         });
       }
     }

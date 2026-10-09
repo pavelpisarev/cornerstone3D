@@ -17,6 +17,17 @@ import MIPJumpToClickTool from './MIPJumpToClickTool';
 import CrosshairsTool from './CrosshairsTool';
 import WorldCrosshairTool from './WorldCrosshairTool';
 import SliceIntersectionTool from './SliceIntersectionTool';
+import {
+  getWorldPointManager,
+  resetWorldPointManager,
+} from './WorldPointManager';
+export type {
+  WorldPointSubscriber,
+  WorldPointState,
+  WorldPointManagerConfig,
+  CameraPlane,
+  ViewportType as WorldPointViewportType,
+} from './WorldPointManager';
 import MagnifyTool from './MagnifyTool';
 import AdvancedMagnifyTool from './AdvancedMagnifyTool';
 import ReferenceLinesTool from './ReferenceLinesTool';
@@ -98,6 +109,8 @@ export {
   CrosshairsTool,
   WorldCrosshairTool,
   SliceIntersectionTool,
+  getWorldPointManager,
+  resetWorldPointManager,
   ReferenceLinesTool,
   OverlayGridTool,
   SegmentationIntersectionTool,
