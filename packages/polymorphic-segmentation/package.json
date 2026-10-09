@@ -52,7 +52,9 @@
   },
   "homepage": "https://github.com/cornerstonejs/cornerstone3D/blob/main/packages/polymorphic-segmentation/README.md",
   "dependencies": {
-    "@icr/polyseg-wasm": "0.4.0"
+    "@icr/polyseg-wasm": "0.4.0",
+    "comlink": "4.4.2",
+    "gl-matrix": "3.4.3"
   },
   "devDependencies": {
     "@cornerstonejs/core": "5.10.3",
